@@ -3,3 +3,12 @@ node_modules
 .env
 
 /generated/prisma
+  GNU nano 8.2                       .gitignore
+node_modules
+# Keep environment variables out of version control
+.env
+
+/generated/prisma
+node_modules
+.env
+*.log
