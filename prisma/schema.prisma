@@ -8,11 +8,11 @@ datasource db {
 }
 
 enum Role {
-  ADMIN
-  INSPECTOR
-  SITE_AGENT
-  RE
-  ARE
+  Admin 
+  Inspector 
+  Site_Agent 
+  R.E
+  A.R.E
 }
 
 model User {
