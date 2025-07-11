@@ -5,7 +5,7 @@ const prisma = require("../prismaClient");
 
 router.post("/", async (req, res) => {
   const { username, password } = req.body;
-  console.log("📥 Login attempt:", username);
+  console.log("🥳 Login attempt:", username);
 
   try {
     const user = await prisma.user.findUnique({ where: { username } });
