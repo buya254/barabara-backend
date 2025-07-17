@@ -1,30 +1,44 @@
 const express = require("express");
 const router = express.Router();
-const bcrypt = require("bcryptjs");
-const prisma = require("../prismaClient");
+const bcrypt = require("bcrypt");
+const db = require("../db"); // adjust if you move it
 
 router.post("/", async (req, res) => {
   const { username, password } = req.body;
-  console.log("🥳 Login attempt:", username);
+
+  console.log("🛎️ Login attempt:");
+  console.log("Username received:", username);
+  console.log("Password received:", password);
 
   try {
-    const user = await prisma.user.findUnique({ where: { username } });
+    const [rows] = await db.execute(
+      "SELECT * FROM users WHERE username = ?",
+      [username]
+    );
 
-    if (!user) return res.status(401).json({ message: "User not found" });
+    if (rows.length === 0) {
+      return res.status(401).json({ msg: "User not found" });
+    }
 
-    const valid = bcrypt.compareSync(password, user.password);
-    if (!valid) return res.status(401).json({ message: "Invalid password" });
+    const user = rows[0];
+    console.log("🔐 Stored hash:", user.password_hash);
 
-    return res.status(200).json({
-      user: {
-        username: user.username,
-        role: user.role,
-      },
-    });
+    const isMatch = await bcrypt.compare(password, user.password_hash);
 
+    if (!isMatch) {
+      return res.status(403).json({ msg: "Invalid credentials" });
+    }
+
+    const userData = {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+    };
+
+    res.json({ user: userData });
   } catch (err) {
-    console.error("❌ Server error:", err);
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("Login error:", err);
+    res.status(500).json({ msg: "Server error" });
   }
 });
 
