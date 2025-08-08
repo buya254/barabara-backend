@@ -1,7 +1,7 @@
 // routes/loginRoute.js
 const express = require('express');
 const router = express.Router();
-const db = require('../database');
+const db = require('../db');
 const bcrypt = require('bcrypt'); // If you use hashed passwords
 const session = require('express-session');
 
