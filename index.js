@@ -1,64 +1,62 @@
 require("dotenv").config();
-
 const express = require("express");
-const cors = require("cors");
 const session = require("express-session");
+const cors = require("cors");
+
 const loginRoute = require("./routes/loginRoute");
 const logoutRoute = require("./routes/logoutRoute");
+const sessionRoute = require("./routes/sessionRoute");
+
 const db = require("./db");
-const sessionRoute = require('./routes/sessionRoute');
 
 const app = express();
 
-// CORS
+// CORS (allow frontend at port 3000)
 app.use(cors({
-  origin: "http://localhost:3000", // frontend
+  origin: "http://localhost:3000",
   credentials: true
 }));
 
-// Middleware
+// Body Parsers
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Session
+// Session Middleware
 app.use(session({
   secret: process.env.SESSION_SECRET || "yoursecret",
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 3600000,       // 1 hour
-    secure: false,         // true if using HTTPS at production stage
-    httpOnly: true,        // prevent client-side JS access
-    sameSite: 'lax'        // or 'none' with secure: true
+    maxAge: 3600000,           // 1 hour
+    secure: false,             // true in production with HTTPS
+    httpOnly: true,            // JS on client can't access cookie
+    sameSite: "lax"            // 'none' if using secure: true and cross-site
   }
 }));
 
-// Log session for debugging (move above routes)
+// Log session contents (optional)
 app.use((req, res, next) => {
-  console.log("🧠 Session info:", req.session);
+  console.log("💾 Session info:", req.session);
   next();
 });
 
-// Mount routes
-app.use("/", loginRoute);
+// Mount Routes
+app.use("/login", loginRoute);     // POST /login
+app.use("/logout", logoutRoute);   // GET /logout (optional)
+app.use("/", sessionRoute);        // GET /check-session
 
-// 🔌 Test DB connection (before starting server)
+// Confirm DB Connection Before Starting
 (async () => {
   try {
     await db.query("SELECT 1");
     console.log("✅ Database connected successfully");
+
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+    });
+
   } catch (err) {
     console.error("❌ Database connection failed:", err);
   }
 })();
-
-app.use('/session', sessionRoute);
-
-app.use("/logout", logoutRoute);
-
-
-// Start server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
-});

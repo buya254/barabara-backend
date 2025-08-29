@@ -1,5 +1,5 @@
 // seed.js
-const bcrypt = require("bcryptjs");
+const bcrypt = require("bcrypt");
 const db = require("./db"); // Ensure this points to your actual db connection file
 
 async function insertMany(table, users) {

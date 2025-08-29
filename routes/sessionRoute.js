@@ -1,12 +1,14 @@
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
-router.get('/', (req, res) => {
-  if (req.session.user) {
-    res.status(200).json({ user: req.session.user });
-  } else {
-    res.status(401).json({ message: 'Not logged in' });
+router.get("/check-session", (req, res) => {
+  if (req.session && req.session.user) {
+    return res.json({
+      loggedIn: true,
+      user: req.session.user
+    });
   }
+  res.json({ loggedIn: false });
 });
 
 module.exports = router;
