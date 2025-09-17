@@ -6,6 +6,7 @@ const cors = require("cors");
 const loginRoute = require("./routes/loginRoute");
 const logoutRoute = require("./routes/logoutRoute");
 const sessionRoute = require("./routes/sessionRoute");
+const userRoutes = require("./routes/Users");
 
 const db = require("./db");
 
@@ -44,6 +45,7 @@ app.use((req, res, next) => {
 app.use("/login", loginRoute);     // POST /login
 app.use("/logout", logoutRoute);   // GET /logout (optional)
 app.use("/", sessionRoute);        // GET /check-session
+app.use("/api", userRoutes);
 
 // Confirm DB Connection Before Starting
 (async () => {
