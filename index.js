@@ -11,6 +11,7 @@ const userRoutes = require("./routes/Users");
 const db = require("./db");
 
 const app = express();
+const importUsersRoutes =require("./routes/importUsers");
 
 // CORS (allow frontend at port 3000)
 app.use(cors({
@@ -46,6 +47,7 @@ app.use("/login", loginRoute);     // POST /login
 app.use("/logout", logoutRoute);   // GET /logout (optional)
 app.use("/", sessionRoute);        // GET /check-session
 app.use("/api", userRoutes);
+app.use("/api/import-users", importUsersRoutes);
 
 // Confirm DB Connection Before Starting
 (async () => {
