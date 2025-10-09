@@ -1,23 +1,42 @@
 const express = require("express");
 const router = express.Router();
-const db = require("../db"); // 👈 adjust path if your db file is in another folder
-const bcrypt = require("bcrypt"); // in case you want to hash passwords
+const db = require("../db");
+const bcrypt = require("bcrypt");
 
-// 🔒 Users that should never be visible or deletable in UI
+// These usernames should never show up in the frontend
 const excludedUsernames = ["phabade", "bmagenyi"];
 
-/**
- * GET all users
- * Example: GET /api/users
- */
+/** GET all users with optional filters */
 router.get("/users", async (req, res) => {
   try {
-    const [users] = await db.query("SELECT * FROM users");
+    const { username, fy, project, phone } = req.query;
 
-    // Filter out seeded users
-    const filtered = users.filter(
-      (u) => !excludedUsernames.includes(u.username)
-    );
+    let query = "SELECT * FROM users WHERE 1=1";
+    const values = [];
+
+    if (username) {
+      query += " AND username LIKE ?";
+      values.push(`%${username}%`);
+    }
+
+    if (fy) {
+      query += " AND financial_year LIKE ?";
+      values.push(`%${fy}%`);
+    }
+
+    if (project) {
+      query += " AND project_name LIKE ?";
+      values.push(`%${project}%`);
+    }
+
+    if (phone) {
+      query += " AND phone LIKE ?";
+      values.push(`%${phone}%`);
+    }
+
+    const [users] = await db.query(query, values);
+
+    const filtered = users.filter((u) => !excludedUsernames.includes(u.username));
 
     res.json(filtered);
   } catch (err) {
@@ -26,26 +45,70 @@ router.get("/users", async (req, res) => {
   }
 });
 
-/**
- * CREATE new user
- * Example: POST /api/users
- */
-router.post("/users", async (req, res) => {
-  const { username, email, role, password } = req.body;
+/** GET paginated users */
+router.get("/users-paged", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = (page - 1) * limit;
 
-  if (!username || !email || !role) {
-    return res.status(400).json({ message: "All fields are required" });
+  try {
+    const [countResult] = await db.query("SELECT COUNT(*) AS total FROM users");
+    const total = countResult[0].total;
+
+    const [rows] = await db.query("SELECT * FROM users LIMIT ? OFFSET ?", [limit, offset]);
+
+    const filtered = rows.filter((u) => !excludedUsernames.includes(u.username));
+
+    res.json({
+      users: filtered,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+    });
+  } catch (err) {
+    console.error("Pagination error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/** CREATE a new user */
+router.post("/users", async (req, res) => {
+  const {
+    username,
+    password,
+    role,
+    full_name,
+    email,
+    financial_year,
+    project_name,
+    project_number,
+    phone,
+    signature,
+  } = req.body;
+
+  if (!username || !password || !email || !role) {
+    return res.status(400).json({ message: "Required fields missing" });
   }
 
   try {
-    // Hash password if provided, else use default
-    const passwordHash = password
-      ? await bcrypt.hash(password, 10)
-      : await bcrypt.hash("ChangeMe123", 10);
+    const passwordHash = await bcrypt.hash(password, 10);
 
     await db.query(
-      "INSERT INTO users (username, email, role, password_hash) VALUES (?, ?, ?, ?)",
-      [username, email, role, passwordHash]
+      `INSERT INTO users  
+      (username, password, role, full_name, email, financial_year, project_name, project_number, phone, signature)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        username,
+        passwordHash,
+        role,
+        full_name,
+        email,
+        financial_year,
+        project_name,
+        project_number,
+        phone,
+        signature,
+      ]
     );
 
     res.status(201).json({ message: "User created successfully" });
@@ -55,18 +118,40 @@ router.post("/users", async (req, res) => {
   }
 });
 
-/**
- * UPDATE existing user
- * Example: PUT /api/users/5
- */
+/** UPDATE existing user */
 router.put("/users/:id", async (req, res) => {
   const userId = req.params.id;
-  const { username, email, role } = req.body;
+  const {
+    username,
+    role,
+    full_name,
+    email,
+    financial_year,
+    project_name,
+    project_number,
+    phone,
+    signature,
+  } = req.body;
 
   try {
     await db.query(
-      "UPDATE users SET username = ?, email = ?, role = ? WHERE id = ?",
-      [username, email, role, userId]
+      `UPDATE users
+      SET username = ?, role = ?, full_name = ?, email = ?,  
+          financial_year = ?, project_name = ?, project_number = ?,  
+          phone = ?, signature = ?
+      WHERE id = ?`,
+      [
+        username,
+        role,
+        full_name,
+        email,
+        financial_year,
+        project_name,
+        project_number,
+        phone,
+        signature,
+        userId,
+      ]
     );
 
     res.json({ message: "User updated successfully" });
@@ -76,18 +161,28 @@ router.put("/users/:id", async (req, res) => {
   }
 });
 
-/**
- * DELETE user
- * Example: DELETE /api/users/5
- */
+/** RESET password to default */
+router.put("/users/reset-password/:id", async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const defaultPassword = "Kura1234"; // Can be changed
+    const hashed = await bcrypt.hash(defaultPassword, 10);
+
+    await db.query("UPDATE users SET password = ? WHERE id = ?", [hashed, userId]);
+
+    res.json({ message: "Password reset to default." });
+  } catch (err) {
+    console.error("Reset failed:", err);
+    res.status(500).json({ message: "Reset failed." });
+  }
+});
+
+/** DELETE user */
 router.delete("/users/:id", async (req, res) => {
   const userId = req.params.id;
 
   try {
-    // First check if user is protected
-    const [rows] = await db.query("SELECT username FROM users WHERE id = ?", [
-      userId,
-    ]);
+    const [rows] = await db.query("SELECT username FROM users WHERE id = ?", [userId]);
 
     if (rows.length === 0) {
       return res.status(404).json({ message: "User not found" });

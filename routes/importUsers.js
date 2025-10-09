@@ -9,10 +9,19 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // ✅ Human-friendly Excel headers
 const TEMPLATE_HEADERS = [
-  "National ID", "Username", "Password", "Full Name", "Role",
-  "Email", "Financial Year", "Project Name", "Project Number",
-  "Phone Number", "Signature"
+  "National ID",
+  "Username",
+  "Password",
+  "Full Name",
+  "Role",
+  "Email",
+  "Financial Year",
+  "Project Name",
+  "Project Number",
+  "Phone Number",
+  "Signature"
 ];
+
 
 // ✅ Route: download template
 router.get("/download-template", (req, res) => {
@@ -55,10 +64,12 @@ router.post("/upload-users", upload.single("file"), async (req, res) => {
       TEMPLATE_HEADERS.every((h, i) => firstRow[i] === h);
 
     if (!headerOk) {
-      console.error("❌ Header mismatch. Expected:", TEMPLATE_HEADERS, "Got:", firstRow);
-      return res.status(400).json({ message: "Excel template headers do not match expected format" });
+    console.error("❌ Wrong template uploaded!");
+    return res.status(400).json({
+    success: false,
+    message: "Invalid template. Please download a fresh copy from the system."
+    });
     }
-
     // ✅ Map human headers → DB fields
     const mappedRows = rows.map(r => ({
       id: r["National ID"],
