@@ -6,6 +6,9 @@ const bcrypt = require("bcrypt");
 // These usernames should never show up in the frontend
 const excludedUsernames = ["phabade", "bmagenyi"];
 
+// One place to define default password (or override via .env)
+const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "kura@123";
+
 /** GET all users with optional filters */
 router.get("/users", async (req, res) => {
   try {
@@ -72,49 +75,95 @@ router.get("/users-paged", async (req, res) => {
 });
 
 /** CREATE a new user */
+/** CREATE a new user (manual or from UI) */
 router.post("/users", async (req, res) => {
   const {
+    id,                // National ID
     username,
-    password,
-    role,
     full_name,
+    role,
     email,
     financial_year,
     project_name,
     project_number,
     phone,
-    signature,
   } = req.body;
 
-  if (!username || !password || !email || !role) {
-    return res.status(400).json({ message: "Required fields missing" });
-  }
-
   try {
-    const passwordHash = await bcrypt.hash(password, 10);
+    // --- Required fields ---
+    if (!id || !username || !role || !financial_year) {
+      return res.status(400).json({
+        success: false,
+        message: "id, username, role and financial_year are required",
+      });
+    }
 
-    await db.query(
-      `INSERT INTO users  
-      (username, password, role, full_name, email, financial_year, project_name, project_number, phone, signature)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        username,
-        passwordHash,
-        role,
-        full_name,
-        email,
-        financial_year,
-        project_name,
-        project_number,
-        phone,
-        signature,
-      ]
+    // --- National ID: 6–10 digits ---
+    const idStr = String(id).trim();
+    if (!/^\d{6,10}$/.test(idStr)) {
+      return res.status(400).json({
+        success: false,
+        message: "National ID must be 6–10 digits (numbers only)",
+      });
+    }
+
+    // --- Allowed roles (same set you expect in the system) ---
+    const allowedRoles = ["admin", "inspector", "siteagent", "are", "re"];
+    const normalizedRole = String(role).toLowerCase();
+
+    if (!allowedRoles.includes(normalizedRole)) {
+      return res.status(400).json({
+        success: false,
+        message: `Role must be one of: ${allowedRoles.join(", ")}`,
+      });
+    }
+
+    // --- Check for duplicates (ID or username) ---
+    const [existing] = await db.query(
+      "SELECT id, username FROM users WHERE id = ? OR username = ?",
+      [idStr, username]
     );
 
-    res.status(201).json({ message: "User created successfully" });
+    if (existing.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: "A user with this National ID or username already exists",
+      });
+    }
+
+    // --- Hash default password (same as reset) ---
+    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+
+    // --- Insert into users table ---
+    const insertSql = `
+      INSERT INTO users
+        (id, username, password, role, full_name, email,
+         financial_year, project_name, project_number, phone, signature)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    await db.query(insertSql, [
+      idStr,
+      username,
+      passwordHash,
+      normalizedRole,
+      full_name || null,
+      email || null,
+      financial_year,
+      project_name || null,
+      project_number || null,
+      phone || null,
+      null, // signature
+    ]);
+
+    return res.status(201).json({
+      success: true,
+      message: "User created successfully",
+      defaultPassword: DEFAULT_PASSWORD, // nice reminder for the UI
+    });
   } catch (err) {
     console.error("Failed to create user:", err);
-    res.status(500).json({ message: "Server error" });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
@@ -165,17 +214,22 @@ router.put("/users/:id", async (req, res) => {
 router.put("/users/reset-password/:id", async (req, res) => {
   try {
     const userId = req.params.id;
-    const defaultPassword = "Kura1234"; // Can be changed
-    const hashed = await bcrypt.hash(defaultPassword, 10);
+
+    const hashed = await bcrypt.hash(DEFAULT_PASSWORD, 10);
 
     await db.query("UPDATE users SET password = ? WHERE id = ?", [hashed, userId]);
 
-    res.json({ message: "Password reset to default." });
+    res.json({
+      success: true,
+      message: "Password reset to default.",
+      defaultPassword: DEFAULT_PASSWORD,
+    });
   } catch (err) {
     console.error("Reset failed:", err);
-    res.status(500).json({ message: "Reset failed." });
+    res.status(500).json({ success: false, message: "Reset failed." });
   }
 });
+
 
 /** DELETE user */
 router.delete("/users/:id", async (req, res) => {
