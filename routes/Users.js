@@ -74,6 +74,74 @@ router.get("/users-paged", async (req, res) => {
   }
 });
 
+/** EXPORT all users (except seeded) as CSV */
+router.get("/users/export", async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `
+      SELECT 
+        id,
+        username,
+        full_name,
+        role,
+        email,
+        financial_year,
+        project_name,
+        project_number,
+        phone
+      FROM users
+      WHERE username NOT IN (?, ?)
+      ORDER BY username
+      `,
+      excludedUsernames
+    );
+
+    const headers = [
+      "National ID",
+      "Username",
+      "Full Name",
+      "Role",
+      "Email",
+      "Financial Year",
+      "Project Name",
+      "Project Number",
+      "Phone",
+    ];
+
+    const csvRows = [headers];
+
+    for (const row of rows) {
+      const line = [
+        row.id ?? "",
+        row.username ?? "",
+        row.full_name ?? "",
+        row.role ?? "",
+        row.email ?? "",
+        row.financial_year ?? "",
+        row.project_name ?? "",
+        row.project_number ?? "",
+        row.phone ?? "",
+      ].map((value) =>
+        `"${String(value).replace(/"/g, '""')}"`
+      ); // escape double quotes
+
+      csvRows.push(line.join(","));
+    }
+
+    const csvContent = csvRows.join("\r\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=Users_Backup.csv"
+    );
+    res.send(csvContent);
+  } catch (err) {
+    console.error("Failed to export users:", err);
+    res.status(500).json({ message: "Failed to export users" });
+  }
+});
+
 /** CREATE a new user */
 /** CREATE a new user (manual or from UI) */
 router.post("/users", async (req, res) => {
