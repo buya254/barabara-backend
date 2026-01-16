@@ -12,7 +12,7 @@ const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "kura@123";
 /** GET all users with optional filters */
 router.get("/users", async (req, res) => {
   try {
-    const { username, fy, project, phone } = req.query;
+    const { username, fy, project, phone, region } = req.query;
 
     let query = "SELECT * FROM users WHERE 1=1";
     const values = [];
@@ -35,6 +35,10 @@ router.get("/users", async (req, res) => {
     if (phone) {
       query += " AND phone LIKE ?";
       values.push(`%${phone}%`);
+    }
+    if (region) {
+      query += " AND region LIKE ?";
+      values.push(`%${region}%`);
     }
 
     const [users] = await db.query(query, values);
@@ -84,6 +88,7 @@ router.get("/users/export", async (req, res) => {
         username,
         full_name,
         role,
+        region,
         email,
         financial_year,
         project_name,
@@ -101,6 +106,7 @@ router.get("/users/export", async (req, res) => {
       "Username",
       "Full Name",
       "Role",
+      "Region",
       "Email",
       "Financial Year",
       "Project Name",
@@ -116,6 +122,7 @@ router.get("/users/export", async (req, res) => {
         row.username ?? "",
         row.full_name ?? "",
         row.role ?? "",
+        row.region ??"",
         row.email ?? "",
         row.financial_year ?? "",
         row.project_name ?? "",
@@ -150,6 +157,7 @@ router.post("/users", async (req, res) => {
     username,
     full_name,
     role,
+    region,
     email,
     financial_year,
     project_name,
@@ -159,10 +167,10 @@ router.post("/users", async (req, res) => {
 
   try {
     // --- Required fields ---
-    if (!id || !username || !role || !financial_year) {
+    if (!id || !username || !role || !financial_year || !region) {
       return res.status(400).json({
         success: false,
-        message: "id, username, role and financial_year are required",
+        message: "id, username, role, region and financial_year are required",
       });
     }
 
@@ -205,7 +213,7 @@ router.post("/users", async (req, res) => {
     // --- Insert into users table ---
     const insertSql = `
       INSERT INTO users
-        (id, username, password, role, full_name, email,
+        (id, username, password, role, region, full_name, email,
          financial_year, project_name, project_number, phone, signature)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
@@ -215,6 +223,7 @@ router.post("/users", async (req, res) => {
       username,
       passwordHash,
       normalizedRole,
+      region || null,
       full_name || null,
       email || null,
       financial_year,
@@ -241,6 +250,7 @@ router.put("/users/:id", async (req, res) => {
   const {
     username,
     role,
+    region,
     full_name,
     email,
     financial_year,
@@ -253,13 +263,14 @@ router.put("/users/:id", async (req, res) => {
   try {
     await db.query(
       `UPDATE users
-      SET username = ?, role = ?, full_name = ?, email = ?,  
+      SET username = ?, role = ?, region = ?,full_name = ?, email = ?,  
           financial_year = ?, project_name = ?, project_number = ?,  
           phone = ?, signature = ?
       WHERE id = ?`,
       [
         username,
         role,
+        region,
         full_name,
         email,
         financial_year,

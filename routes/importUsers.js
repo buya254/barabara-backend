@@ -14,6 +14,7 @@ const TEMPLATE_HEADERS = [
   "Password",
   "Full Name",
   "Role",
+  "Region",
   "Email",
   "Financial Year",
   "Project Name",
@@ -42,6 +43,8 @@ const TEMPLATE_HEADERS = [
       "Admin": "admin",
       "Administrator": "admin",
       "admin":"admin",
+      "Region":"region",
+      "region":"region",
 
 };
 
@@ -102,6 +105,7 @@ router.post("/upload-users", upload.single("file"), async (req, res) => {
       password: r["Password"],
       full_name: r["Full Name"],
       role: r["Role"],
+      region: r["Region"],
       email: r["Email"],
       financial_year: r["Financial Year"],
       project_name: r["Project Name"],
@@ -228,7 +232,7 @@ router.post("/upload-users", upload.single("file"), async (req, res) => {
 
         const sql = `
           INSERT INTO users 
-          (id, username, password, full_name, role, email, financial_year, project_name, project_number, phone, signature) 
+          (id, username, password, full_name, role, region, email, financial_year, project_name, project_number, phone, signature) 
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
@@ -238,6 +242,7 @@ router.post("/upload-users", upload.single("file"), async (req, res) => {
           hashed,
           u.full_name,
           normalizedRole,       // 👈 use normalizedRole here
+          u.region || null,
           u.email,
           u.financial_year,
           u.project_name,
@@ -306,6 +311,7 @@ router.post("/compare-users", upload.single("file"), async (req, res) => {
       username: r["Username"] || "",
       full_name: r["Full Name"] || "",
       role: r["Role"] || "",
+      region: r["Region"] || "",
       email: r["Email"] || "",
       financial_year: r["Financial Year"] || "",
       project_name: r["Project Name"] || "",
@@ -330,7 +336,7 @@ router.post("/compare-users", upload.single("file"), async (req, res) => {
 
     // Get ALL users from DB (or you can restrict by FY later if you want)
     const [dbUsers] = await db.query(
-      "SELECT id, username, full_name, role, financial_year, project_name FROM users"
+      "SELECT id, username, full_name, role, region, financial_year, project_name FROM users"
     );
 
     const dbIdSet = new Set(dbUsers.map((u) => String(u.id)));
