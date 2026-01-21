@@ -7,7 +7,7 @@ const bcrypt = require("bcrypt");
 const excludedUsernames = ["phabade", "bmagenyi"];
 
 // One place to define default password (or override via .env)
-const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "kura@123";
+const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "Kura1234";
 
 /** GET all users with optional filters */
 router.get("/users", async (req, res) => {
@@ -212,26 +212,29 @@ router.post("/users", async (req, res) => {
 
     // --- Insert into users table ---
     const insertSql = `
-      INSERT INTO users
-        (id, username, password, role, region, full_name, email,
-         financial_year, project_name, project_number, phone, signature)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
+        INSERT INTO users
+          (id, username, password, role, region, full_name, email,
+          financial_year, project_name, project_number, phone, signature,
+          must_change_password, password_updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
 
-    await db.query(insertSql, [
-      idStr,
-      username,
-      passwordHash,
-      normalizedRole,
-      region || null,
-      full_name || null,
-      email || null,
-      financial_year,
-      project_name || null,
-      project_number || null,
-      phone || null,
-      null, // signature
-    ]);
+      await db.query(insertSql, [
+        idStr,
+        username,
+        passwordHash,
+        normalizedRole,
+        region || null,
+        full_name || null,
+        email || null,
+        financial_year,
+        project_name || null,
+        project_number || null,
+        phone || null,
+        null, // signature
+        excludedUsernames.includes(username) ? 0 : 1, // must_change_password
+        null, // password_updated_at
+      ]);
 
     return res.status(201).json({
       success: true,
@@ -296,7 +299,10 @@ router.put("/users/reset-password/:id", async (req, res) => {
 
     const hashed = await bcrypt.hash(DEFAULT_PASSWORD, 10);
 
-    await db.query("UPDATE users SET password = ? WHERE id = ?", [hashed, userId]);
+    await db.query(
+      "UPDATE users SET password = ?, must_change_password = 1, password_updated_at = NULL WHERE id = ?",
+      [hashed, userId]
+    );
 
     res.json({
       success: true,

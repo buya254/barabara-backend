@@ -24,6 +24,8 @@ router.post("/", async (req, res) => {
     }
 
     const user = rows[0];
+    const mustChangePassword = user.must_change_password === 1;
+
 
     const role = user.role;
     const fy = user.financial_year; // use your actual column name
@@ -57,11 +59,14 @@ router.post("/", async (req, res) => {
     res.json({
       message: "Login successful",
       token,
+      mustChangePassword,
       user: {
         username: user.username,
         role,
-        full_name: user.full_name || null, // safe if column missing
+        full_name: user.full_name || null,
         fy,
+        mustChangePassword,
+        must_change_password: user.must_change_password,
       },
     });
   } catch (err) {
