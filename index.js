@@ -13,6 +13,12 @@ const db = require("./db");
 const app = express();
 const importUsersRoutes =require("./routes/importUsers");
 const authRoute = require("./routes/authRoute");
+const dailyWorkReports = require("./routes/dailyWorkReports");
+const projectAccessRoute = require("./routes/projectAccess");
+const projectsRouter = require("./routes/projects");
+const importProjectsRoutes = require("./routes/importProjectsRoutes");
+
+
 
 
 // CORS (allow frontend at port 3000)
@@ -52,6 +58,11 @@ app.use("/", sessionRoute);        // GET /check-session
 app.use("/api", userRoutes);
 app.use("/api/import-users", importUsersRoutes);
 app.use("/api/auth", authRoute);
+app.use("/api/daily-work-reports", dailyWorkReports);
+app.use("/api/project-access", projectAccessRoute);
+app.use("/api/projects", projectsRouter);
+app.use("/api/import-projects", importProjectsRoutes);
+
 
 
 // Confirm DB Connection Before Starting
