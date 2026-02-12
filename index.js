@@ -17,6 +17,7 @@ const dailyWorkReports = require("./routes/dailyWorkReports");
 const projectAccessRoute = require("./routes/projectAccess");
 const projectsRouter = require("./routes/projects");
 const importProjectsRoutes = require("./routes/importProjectsRoutes");
+const utilitiesRoutes = require("./routes/utilitiesRoute");
 
 
 
@@ -62,6 +63,7 @@ app.use("/api/daily-work-reports", dailyWorkReports);
 app.use("/api/project-access", projectAccessRoute);
 app.use("/api/projects", projectsRouter);
 app.use("/api/import-projects", importProjectsRoutes);
+app.use("/api/utilities", utilitiesRoutes);
 
 
 
