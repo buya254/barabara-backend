@@ -7,10 +7,8 @@ const router = express.Router();
  * POST /api/utilities/assign-user-project
  * Body: { user_id, project_id, make_primary?: boolean }
  *
- * - Inserts/updates link in user_projects
- * - If make_primary = true, also copies project_number, project_name,
- *   financial_year and region onto the users table (so your existing
- *   screens still work).
+ * Link user <-> project in user_projects.
+ * We no longer touch columns on users (since you dropped project_* there).
  */
 router.post("/assign-user-project", (req, res) => {
   const { user_id, project_id, make_primary } = req.body;
@@ -38,35 +36,9 @@ router.post("/assign-user-project", (req, res) => {
           .json({ message: "Failed to assign project to user" });
       }
 
-      if (!make_primary) {
-        return res.json({ success: true, message: "Assignment saved" });
-      }
-
-      // Also update users table so your existing flows still work
-      const updateUserSql = `
-        UPDATE users u
-        JOIN projects p ON p.id = ?
-        SET 
-          u.project_number = p.project_number,
-          u.project_name   = p.project_name,
-          u.financial_year = p.financial_year,
-          u.region         = p.region
-        WHERE u.id = ?
-      `;
-
-      db.query(updateUserSql, [project_id, user_id], (err2) => {
-        if (err2) {
-          console.error("Error updating user with project data:", err2);
-          return res.status(500).json({
-            message:
-              "Project assigned but failed to sync main user record",
-          });
-        }
-
-        return res.json({
-          success: true,
-          message: "Project assigned and set as primary for user",
-        });
+      return res.json({
+        success: true,
+        message: "Project assigned to user",
       });
     }
   );
@@ -74,7 +46,7 @@ router.post("/assign-user-project", (req, res) => {
 
 /**
  * GET /api/utilities/user-projects/:userId
- * Returns all projects linked to that user.
+ * All projects linked to a user (primary first)
  */
 router.get("/user-projects/:userId", (req, res) => {
   const userId = req.params.userId;
@@ -104,44 +76,132 @@ router.get("/user-projects/:userId", (req, res) => {
 });
 
 /**
- * GET /api/utilities/project-activities/:projectId
- * All activities mapped to that project.
+ * GET /api/utilities/project-roads/:projectId
+ * Roads already packaged into a given project (via contracts + contract_roads)
  */
-router.get("/project-activities/:projectId", (req, res) => {
+router.get("/project-roads/:projectId", (req, res) => {
   const projectId = req.params.projectId;
 
   const sql = `
     SELECT 
-      pa.id,
-      pa.is_active,
-      a.id AS activity_id,
-      a.code,
-      a.name,
-      a.unit
-    FROM project_activities pa
-    JOIN activities a ON a.id = pa.activity_id
-    WHERE pa.project_id = ?
-    ORDER BY a.code ASC
+      r.id,
+      r.road_code,
+      r.road_name,
+      r.town
+    FROM contracts c
+    JOIN contract_roads cr ON cr.contract_id = c.id
+    JOIN roads r          ON r.id = cr.road_id
+    WHERE c.project_id = ?
+    ORDER BY r.town ASC, r.road_code ASC
   `;
 
   db.query(sql, [projectId], (err, rows) => {
     if (err) {
-      console.error("Error loading project activities:", err);
+      console.error("Error loading project roads:", err);
       return res
         .status(500)
-        .json({ message: "Failed to load project activities" });
+        .json({ message: "Failed to load roads for project" });
     }
     res.json(rows);
   });
 });
 
 /**
- * POST /api/utilities/project-activities/:projectId
- * Body: { activityIds: number[] }
- * Replaces the list of activities for that project.
+ * POST /api/utilities/package-roads
+ * Body: { project_id: number, road_codes: string[], reset?: boolean }
+ *
+ * Calls your stored procedure package_roads_to_contract()
+ * so you can re-use it every financial year.
  */
-router.post("/project-activities/:projectId", (req, res) => {
-  const projectId = req.params.projectId;
+router.post("/package-roads", (req, res) => {
+  const { project_id, road_codes, reset } = req.body;
+
+  if (!project_id || !Array.isArray(road_codes) || road_codes.length === 0) {
+    return res.status(400).json({
+      message: "project_id and a non-empty road_codes[] array are required",
+    });
+  }
+
+  // 1) get the project_number for this project
+  const projectSql = "SELECT project_number FROM projects WHERE id = ?";
+
+  db.query(projectSql, [project_id], (err, rows) => {
+    if (err) {
+      console.error("Error fetching project_number:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to find project_number for project" });
+    }
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    const projectNumber = rows[0].project_number;
+    const jsonRoadCodes = JSON.stringify(road_codes);
+
+    // 2) call the stored procedure
+    const callSql = "CALL package_roads_to_contract(?, ?, ?)";
+
+    db.query(
+      callSql,
+      [projectNumber, jsonRoadCodes, reset ? 1 : 0],
+      (err2) => {
+        if (err2) {
+          console.error("Error packaging roads:", err2);
+          return res
+            .status(500)
+            .json({ message: "Failed to package roads to project" });
+        }
+
+        return res.json({
+          success: true,
+          message: "Roads packaged to project successfully",
+        });
+      }
+    );
+  });
+});
+
+/**
+ * GET /api/utilities/road-activities/:roadId
+ * All activities mapped to a specific road
+ */
+router.get("/road-activities/:roadId", (req, res) => {
+  const roadId = req.params.roadId;
+
+  const sql = `
+    SELECT 
+      ra.id,
+      ra.is_active,
+      a.id   AS activity_id,
+      a.code,
+      a.name,
+      a.unit
+    FROM road_activities ra
+    JOIN activities a ON a.id = ra.activity_id
+    WHERE ra.road_id = ?
+    ORDER BY a.code ASC
+  `;
+
+  db.query(sql, [roadId], (err, rows) => {
+    if (err) {
+      console.error("Error loading road activities:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to load activities for road" });
+    }
+    res.json(rows);
+  });
+});
+
+/**
+ * POST /api/utilities/road-activities/:roadId
+ * Body: { activityIds: number[] }
+ * Replaces the list of activities for that road
+ */
+router.post("/road-activities/:roadId", (req, res) => {
+  const roadId = req.params.roadId;
   const { activityIds } = req.body;
 
   if (!Array.isArray(activityIds)) {
@@ -150,44 +210,40 @@ router.post("/project-activities/:projectId", (req, res) => {
       .json({ message: "activityIds must be an array of IDs" });
   }
 
-  // 1) Delete existing
-  db.query(
-    "DELETE FROM project_activities WHERE project_id = ?",
-    [projectId],
-    (err) => {
-      if (err) {
-        console.error("Error deleting old project_activities:", err);
-        return res
-          .status(500)
-          .json({ message: "Failed to reset project activities" });
-      }
+  // 1) delete existing mappings
+  db.query("DELETE FROM road_activities WHERE road_id = ?", [roadId], (err) => {
+    if (err) {
+      console.error("Error deleting old road_activities:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to reset activities for road" });
+    }
 
-      if (activityIds.length === 0) {
-        return res.json({
-          success: true,
-          message: "All activities cleared for project",
-        });
-      }
-
-      const values = activityIds.map((id) => [projectId, id, 1]);
-      const insertSql =
-        "INSERT INTO project_activities (project_id, activity_id, is_active) VALUES ?";
-
-      db.query(insertSql, [values], (err2) => {
-        if (err2) {
-          console.error("Error inserting new project_activities:", err2);
-          return res
-            .status(500)
-            .json({ message: "Failed to assign activities to project" });
-        }
-
-        res.json({
-          success: true,
-          message: "Activities assigned to project",
-        });
+    if (activityIds.length === 0) {
+      return res.json({
+        success: true,
+        message: "All activities cleared for road",
       });
     }
-  );
+
+    const values = activityIds.map((id) => [roadId, id, 1]);
+    const insertSql =
+      "INSERT INTO road_activities (road_id, activity_id, is_active) VALUES ?";
+
+    db.query(insertSql, [values], (err2) => {
+      if (err2) {
+        console.error("Error inserting new road_activities:", err2);
+        return res
+          .status(500)
+          .json({ message: "Failed to assign activities to road" });
+      }
+
+      res.json({
+        success: true,
+        message: "Activities assigned to road",
+      });
+    });
+  });
 });
 
 module.exports = router;

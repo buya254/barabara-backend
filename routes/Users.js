@@ -12,7 +12,7 @@ const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "Kura1234";
 /** GET all users with optional filters */
 router.get("/users", async (req, res) => {
   try {
-    const { username, fy, project, phone, region } = req.query;
+    const { username, fy, phone, region } = req.query;
 
     let query = "SELECT * FROM users WHERE 1=1";
     const values = [];
@@ -25,11 +25,6 @@ router.get("/users", async (req, res) => {
     if (fy) {
       query += " AND financial_year LIKE ?";
       values.push(`%${fy}%`);
-    }
-
-    if (project) {
-      query += " AND project_name LIKE ?";
-      values.push(`%${project}%`);
     }
 
     if (phone) {
@@ -91,8 +86,6 @@ router.get("/users/export", async (req, res) => {
         region,
         email,
         financial_year,
-        project_name,
-        project_number,
         phone
       FROM users
       WHERE username NOT IN (?, ?)
@@ -109,8 +102,6 @@ router.get("/users/export", async (req, res) => {
       "Region",
       "Email",
       "Financial Year",
-      "Project Name",
-      "Project Number",
       "Phone",
     ];
 
@@ -125,8 +116,6 @@ router.get("/users/export", async (req, res) => {
         row.region ??"",
         row.email ?? "",
         row.financial_year ?? "",
-        row.project_name ?? "",
-        row.project_number ?? "",
         row.phone ?? "",
       ].map((value) =>
         `"${String(value).replace(/"/g, '""')}"`
@@ -160,8 +149,6 @@ router.post("/users", async (req, res) => {
     region,
     email,
     financial_year,
-    project_name,
-    project_number,
     phone,
   } = req.body;
 
@@ -212,12 +199,10 @@ router.post("/users", async (req, res) => {
 
     // --- Insert into users table ---
     const insertSql = `
-        INSERT INTO users
-          (id, username, password, role, region, full_name, email,
-          financial_year, project_name, project_number, phone, signature,
-          must_change_password, password_updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `;
+      INSERT INTO users
+        (id, username, password, role, region, full_name, email, financial_year, phone, signature, must_change_password, password_updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
 
       await db.query(insertSql, [
         idStr,
@@ -228,8 +213,6 @@ router.post("/users", async (req, res) => {
         full_name || null,
         email || null,
         financial_year,
-        project_name || null,
-        project_number || null,
         phone || null,
         null, // signature
         excludedUsernames.includes(username) ? 0 : 1, // must_change_password
@@ -257,8 +240,6 @@ router.put("/users/:id", async (req, res) => {
     full_name,
     email,
     financial_year,
-    project_name,
-    project_number,
     phone,
     signature,
   } = req.body;
@@ -267,8 +248,7 @@ router.put("/users/:id", async (req, res) => {
     await db.query(
       `UPDATE users
       SET username = ?, role = ?, region = ?,full_name = ?, email = ?,  
-          financial_year = ?, project_name = ?, project_number = ?,  
-          phone = ?, signature = ?
+          financial_year = ?, phone = ?, signature = ?
       WHERE id = ?`,
       [
         username,
@@ -277,8 +257,6 @@ router.put("/users/:id", async (req, res) => {
         full_name,
         email,
         financial_year,
-        project_name,
-        project_number,
         phone,
         signature,
         userId,
@@ -293,49 +271,43 @@ router.put("/users/:id", async (req, res) => {
 });
 
 /** RESET password to default */
-router.put("/users/reset-password/:id", async (req, res) => {
-  try {
-    const userId = req.params.id;
-
-    const hashed = await bcrypt.hash(DEFAULT_PASSWORD, 10);
-
-    await db.query(
-      "UPDATE users SET password = ?, must_change_password = 1, password_updated_at = NULL WHERE id = ?",
-      [hashed, userId]
-    );
-
-    res.json({
-      success: true,
-      message: "Password reset to default.",
-      defaultPassword: DEFAULT_PASSWORD,
-    });
-  } catch (err) {
-    console.error("Reset failed:", err);
-    res.status(500).json({ success: false, message: "Reset failed." });
-  }
-});
-
-
-/** DELETE user */
-router.delete("/users/:id", async (req, res) => {
+router.put("/users/:id", async (req, res) => {
   const userId = req.params.id;
 
   try {
-    const [rows] = await db.query("SELECT username FROM users WHERE id = ?", [userId]);
+    const allowed = [
+      "username",
+      "role",
+      "region",
+      "full_name",
+      "email",
+      "financial_year",
+      "phone",
+      "signature",
+    ];
 
-    if (rows.length === 0) {
-      return res.status(404).json({ message: "User not found" });
+    const updates = [];
+    const values = [];
+
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        updates.push(`${key} = ?`);
+        values.push(req.body[key]);
+      }
     }
 
-    if (excludedUsernames.includes(rows[0].username)) {
-      return res.status(403).json({ message: "Cannot delete seeded users" });
+    if (updates.length === 0) {
+      return res.status(400).json({ message: "No valid fields to update" });
     }
 
-    await db.query("DELETE FROM users WHERE id = ?", [userId]);
+    values.push(userId);
 
-    res.json({ message: "User deleted successfully" });
+    const sql = `UPDATE users SET ${updates.join(", ")} WHERE id = ?`;
+    await db.query(sql, values);
+
+    res.json({ message: "User updated successfully" });
   } catch (err) {
-    console.error("Failed to delete user:", err);
+    console.error("Failed to update user:", err);
     res.status(500).json({ message: "Server error" });
   }
 });

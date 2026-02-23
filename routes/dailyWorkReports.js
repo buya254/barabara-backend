@@ -1,6 +1,5 @@
 const express = require("express");
 const router = express.Router();
-
 const db = require("../db");
 const authenticateJWT = require("../middlewares/auth");
 
@@ -339,6 +338,36 @@ router.put("/:id", authenticateJWT, async (req, res) => {
     console.error("❌ daily-work-reports update error:", err);
     return res.status(500).json({ message: "Server error" });
   }
+});
+// DELETE /api/daily-work-reports/:id
+// Only deletes DRAFT reports
+router.delete("/:id", (req, res) => {
+  const reportId = req.params.id;
+
+  if (!reportId) {
+    return res.status(400).json({ message: "Report id is required." });
+  }
+
+  const sql =
+    "DELETE FROM daily_work_reports WHERE id = ? AND status = 'DRAFT'";
+
+  db.query(sql, [reportId], (err, result) => {
+    if (err) {
+      console.error("❌ Delete draft error:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to delete draft. Internal server error." });
+    }
+
+    if (result.affectedRows === 0) {
+      // Either doesn’t exist, or not DRAFT
+      return res.status(404).json({
+        message: "Draft not found, or cannot be deleted in its current status.",
+      });
+    }
+
+    return res.json({ success: true, message: "Draft deleted successfully." });
+  });
 });
 
 /**

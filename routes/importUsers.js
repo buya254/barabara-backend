@@ -232,8 +232,8 @@ router.post("/upload-users", upload.single("file"), async (req, res) => {
 
         const sql = `
           INSERT INTO users 
-          (id, username, password, full_name, role, region, email, financial_year, project_name, project_number, phone, signature) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, username, password, full_name, role, region, email, financial_year, phone, signature) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
         const [result] = await db.execute(sql, [
@@ -245,8 +245,6 @@ router.post("/upload-users", upload.single("file"), async (req, res) => {
           u.region || null,
           u.email,
           u.financial_year,
-          u.project_name,
-          u.project_number,
           u.phone,
           u.signature,
         ]);
@@ -314,8 +312,6 @@ router.post("/compare-users", upload.single("file"), async (req, res) => {
       region: r["Region"] || "",
       email: r["Email"] || "",
       financial_year: r["Financial Year"] || "",
-      project_name: r["Project Name"] || "",
-      project_number: r["Project Number"] || "",
       phone: r["Phone Number"] || "",
       signature: r["Signature"] || "",
     }));
@@ -336,7 +332,7 @@ router.post("/compare-users", upload.single("file"), async (req, res) => {
 
     // Get ALL users from DB (or you can restrict by FY later if you want)
     const [dbUsers] = await db.query(
-      "SELECT id, username, full_name, role, region, financial_year, project_name FROM users"
+      "SELECT id, username, full_name, role, region, financial_year FROM users"
     );
 
     const dbIdSet = new Set(dbUsers.map((u) => String(u.id)));
