@@ -1,3 +1,4 @@
+// routes/dailyWorkReports.js
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
@@ -39,10 +40,9 @@ function isAssignedToProject(user, assignment) {
 }
 
 async function getReport(report_id) {
-  const [rows] = await db.query(
-    "SELECT * FROM daily_work_reports WHERE id = ?",
-    [report_id]
-  );
+  const [rows] = await db.query("SELECT * FROM daily_work_reports WHERE id = ?", [
+    report_id,
+  ]);
   return rows[0] || null;
 }
 
@@ -56,23 +56,6 @@ async function getReportWithParsed(id) {
   }
 }
 
-async function logAction(report_id, action, user, notes = null) {
-  await db.query(
-    `
-    INSERT INTO daily_work_report_actions
-      (report_id, action, actor_id, actor_role, notes)
-    VALUES (?, ?, ?, ?, ?)
-    `,
-    [
-      report_id,
-      action,
-      String(user?.id ?? ""),
-      String(user?.role ?? ""),
-      notes,
-    ]
-  );
-}
-
 /**
  * Resolve project_id.
  * Accepts:
@@ -83,17 +66,113 @@ async function resolveProjectId({ project_id, project_number }) {
   if (project_id) return Number(project_id);
 
   if (project_number) {
-    // IMPORTANT: This requires you to add projects.project_number
     const [pRows] = await db.query(
       "SELECT id FROM projects WHERE project_number = ? LIMIT 1",
       [project_number]
     );
-
     if (pRows.length === 0) return null;
     return Number(pRows[0].id);
   }
 
   return null;
+}
+
+/**
+ * Tracking helper (YOUR workflow):
+ * Site Agent creates draft -> submits to Inspector -> Inspector confirms -> ARE -> RE
+ */
+const statusTracker = (report) => {
+  const s = report.status;
+
+  const map = {
+    DRAFT: {
+      stage: 1,
+      label: "Draft (Site Agent)",
+      nextRole: "siteagent",
+      nextAction: "Submit to Inspector",
+      waitingFor: "Site Agent to submit to Inspector",
+    },
+    SUBMITTED: {
+      stage: 2,
+      label: "Submitted (Waiting Inspector)",
+      nextRole: "inspector",
+      nextAction: "Approve",
+      waitingFor: "Inspector to approve",
+    },
+    CONFIRMED: {
+      stage: 3,
+      label: "Inspector Approved",
+      nextRole: "are",
+      nextAction: "Approve",
+      waitingFor: "A.R.E to approve",
+    },
+    ARE_APPROVED: {
+      stage: 4,
+      label: "ARE Approved",
+      nextRole: "re",
+      nextAction: "Final approve",
+      waitingFor: "R.E to approve",
+    },
+    RE_APPROVED: {
+      stage: 5,
+      label: "RE Approved",
+      nextRole: null,
+      nextAction: "Print",
+      waitingFor: "Completed (Printable)",
+    },
+  };
+
+  return (
+    map[s] || {
+      stage: 0,
+      label: s,
+      nextRole: null,
+      nextAction: null,
+      waitingFor: "Unknown",
+    }
+  );
+};
+
+/**
+ * Action logger -> writes into daily_work_reports_actions (NEW table you created)
+ */
+const logDwrAction = async ({
+  reportId,
+  actionType,
+  userId,
+  userRole,
+  notes = null,
+}) => {
+  await db.query(
+    `INSERT INTO daily_work_reports_actions
+     (report_id, action_type, action_by, action_by_role, notes)
+     VALUES (?, ?, ?, ?, ?)`,
+    [reportId, actionType, userId, userRole || null, notes]
+  );
+};
+
+/**
+ * Fetch latest action for a report
+ */
+async function getLastAction(reportId) {
+  const [rows] = await db.query(
+    `
+    SELECT
+      a.action_type,
+      a.action_by_role,
+      a.notes,
+      a.created_at,
+      u.full_name,
+      u.username
+    FROM daily_work_reports_actions a
+    LEFT JOIN users u ON u.id = a.action_by
+    WHERE a.report_id = ?
+    ORDER BY a.created_at DESC, a.id DESC
+    LIMIT 1
+    `,
+    [reportId]
+  );
+  return rows[0] || null;
 }
 
 // ---------------- ROUTES ----------------
@@ -111,7 +190,9 @@ router.get("/approved/view", authenticateJWT, async (req, res) => {
     const { contract_id, project_id, project_number, form_date } = req.query;
 
     if (!form_date) {
-      return res.status(400).json({ message: "form_date is required (YYYY-MM-DD)" });
+      return res
+        .status(400)
+        .json({ message: "form_date is required (YYYY-MM-DD)" });
     }
 
     let contractId = contract_id;
@@ -122,7 +203,8 @@ router.get("/approved/view", authenticateJWT, async (req, res) => {
 
       if (!resolvedProjectId) {
         return res.status(400).json({
-          message: "Provide contract_id OR project_id OR project_number (and ensure projects.project_number exists).",
+          message:
+            "Provide contract_id OR project_id OR project_number (and ensure projects.project_number exists).",
         });
       }
 
@@ -156,44 +238,141 @@ router.get("/approved/view", authenticateJWT, async (req, res) => {
  * GET list (role-filtered)
  * GET /api/daily-work-reports?project_id=&project_number=&status=&report_date=
  */
+// LIST DAILY REPORTS + TRACKING
 router.get("/", authenticateJWT, async (req, res) => {
   try {
     const { project_id, project_number, status, report_date } = req.query;
-
     const resolvedProjectId = await resolveProjectId({ project_id, project_number });
 
-    let sql = "SELECT * FROM daily_work_reports WHERE 1=1";
+    let sql = `
+      SELECT
+        dwr.*,
+
+        -- last action summary
+        la.last_action_at,
+        act.action_type     AS last_action_type,
+        act.action_by_role  AS last_action_role,
+        act.notes           AS last_action_notes,
+        ua.full_name        AS last_actor_name,
+        ua.username         AS last_actor_username,
+
+        -- assignment ids
+        pwa.siteagent_id    AS assigned_siteagent_id,
+        pwa.inspector_id    AS assigned_inspector_id,
+        pwa.are_id          AS assigned_are_id,
+        pwa.re_id           AS assigned_re_id,
+
+        -- usernames / names for each role
+        sa.username         AS siteagent_username,
+        sa.full_name        AS siteagent_full_name,
+        ins.username        AS inspector_username,
+        ins.full_name       AS inspector_full_name,
+        areu.username       AS are_username,
+        areu.full_name      AS are_full_name,
+        reu.username        AS re_username,
+        reu.full_name       AS re_full_name
+
+      FROM daily_work_reports dwr
+      LEFT JOIN (
+        SELECT report_id, MAX(created_at) AS last_action_at
+        FROM daily_work_reports_actions
+        GROUP BY report_id
+      ) la ON la.report_id = dwr.id
+      LEFT JOIN daily_work_reports_actions act
+        ON act.report_id = dwr.id AND act.created_at = la.last_action_at
+      LEFT JOIN users ua ON ua.id = act.action_by
+
+      LEFT JOIN project_workflow_assignments pwa
+        ON pwa.project_id = dwr.project_id
+      LEFT JOIN users sa   ON sa.id   = pwa.siteagent_id
+      LEFT JOIN users ins  ON ins.id  = pwa.inspector_id
+      LEFT JOIN users areu ON areu.id = pwa.are_id
+      LEFT JOIN users reu  ON reu.id  = pwa.re_id
+
+      WHERE 1 = 1
+    `;
+
     const vals = [];
 
     if (resolvedProjectId) {
-      sql += " AND project_id = ?";
+      sql += " AND dwr.project_id = ?";
       vals.push(resolvedProjectId);
     }
 
     if (status) {
-      sql += " AND status = ?";
+      sql += " AND dwr.status = ?";
       vals.push(status);
     }
 
     if (report_date) {
-      sql += " AND report_date = ?";
+      sql += " AND dwr.report_date = ?";
       vals.push(report_date);
     }
 
-    sql += " ORDER BY report_date DESC, id DESC";
+    sql += " ORDER BY dwr.report_date DESC, dwr.id DESC";
 
     const [rows] = await db.query(sql, vals);
 
-    // Admin sees all; others see only assigned projects
-    if (String(req.user.role).toLowerCase() === "admin") {
-      return res.json(rows);
+    // Build tracking object, including assigned usernames
+    const buildTracking = (r) => {
+      const base = statusTracker(r);
+
+      const assignedSiteAgent =
+        r.siteagent_username || r.siteagent_full_name || null;
+      const assignedInspector =
+        r.inspector_username || r.inspector_full_name || null;
+      const assignedARE = r.are_username || r.are_full_name || null;
+      const assignedRE = r.re_username || r.re_full_name || null;
+
+      // Put the *person* in the "waitingFor" text where we know them
+      let waitingFor = base.waitingFor;
+      if (base.nextRole === "siteagent" && assignedSiteAgent) {
+        waitingFor = `Site Agent (${assignedSiteAgent}) to ${base.nextAction?.toLowerCase() || "continue"}`;
+      } else if (base.nextRole === "inspector" && assignedInspector) {
+        waitingFor = `Inspector (${assignedInspector}) to ${base.nextAction?.toLowerCase() || "continue"}`;
+      } else if (base.nextRole === "are" && assignedARE) {
+        waitingFor = `A.R.E (${assignedARE}) to ${base.nextAction?.toLowerCase() || "continue"}`;
+      } else if (base.nextRole === "re" && assignedRE) {
+        waitingFor = `R.E (${assignedRE}) to ${base.nextAction?.toLowerCase() || "continue"}`;
+      }
+
+      return {
+        ...base,
+        waitingFor,
+        lastActionAt: r.last_action_at || null,
+        lastActionType: r.last_action_type || null,
+        lastActorName: r.last_actor_name || r.last_actor_username || null,
+        lastActorRole: r.last_action_role || null,
+        lastActionNotes: r.last_action_notes || null,
+        assignedSiteAgentUsername: assignedSiteAgent,
+        assignedInspectorUsername: assignedInspector,
+        assignedAREUsername: assignedARE,
+        assignedREUsername: assignedRE,
+      };
+    };
+
+    const withTracking = rows.map((r) => ({
+      ...r,
+      tracking: buildTracking(r),
+    }));
+
+    const userRole = String(req.user.role).toLowerCase();
+
+    // Admin sees everything
+    if (userRole === "admin") {
+      return res.json(withTracking);
     }
 
-    const filtered = [];
-    for (const r of rows) {
-      const assignment = await getAssignment(r.project_id);
-      if (isAssignedToProject(req.user, assignment)) filtered.push(r);
-    }
+    // Others: only see reports where they're in the workflow
+    const uid = String(req.user.id);
+    const filtered = withTracking.filter((r) => {
+      return (
+        String(r.assigned_siteagent_id || "") === uid ||
+        String(r.assigned_inspector_id || "") === uid ||
+        String(r.assigned_are_id || "") === uid ||
+        String(r.assigned_re_id || "") === uid
+      );
+    });
 
     return res.json(filtered);
   } catch (err) {
@@ -212,14 +391,24 @@ router.get("/:id", authenticateJWT, async (req, res) => {
     if (!report) return res.status(404).json({ message: "Report not found" });
 
     const assignment = await getAssignment(report.project_id);
-
     const isAdmin = String(req.user.role).toLowerCase() === "admin";
     const allowed = isAdmin || isAssignedToProject(req.user, assignment);
-
     if (!allowed) return res.status(403).json({ message: "Forbidden" });
 
     const withParsed = await getReportWithParsed(report.id);
-    return res.json(withParsed);
+    const lastAction = await getLastAction(report.id);
+
+    return res.json({
+      ...withParsed,
+      tracking: {
+        ...statusTracker(report),
+        lastActionAt: lastAction?.created_at || null,
+        lastActionType: lastAction?.action_type || null,
+        lastActorName: lastAction?.full_name || lastAction?.username || null,
+        lastActorRole: lastAction?.action_by_role || null,
+        lastActionNotes: lastAction?.notes || null,
+      },
+    });
   } catch (err) {
     console.error("❌ daily-work-reports get error:", err);
     return res.status(500).json({ message: "Server error" });
@@ -285,7 +474,13 @@ router.post("/", authenticateJWT, async (req, res) => {
       String(req.user.id),
     ]);
 
-    await logAction(result.insertId, "CREATE_DRAFT", req.user, null);
+    // ✅ action log
+    await logDwrAction({
+      reportId: result.insertId,
+      actionType: "CREATED",
+      userId: req.user.id,
+      userRole: req.user.role,
+    });
 
     const created = await getReportWithParsed(result.insertId);
     return res.status(201).json({ message: "Draft created", report: created });
@@ -330,7 +525,12 @@ router.put("/:id", authenticateJWT, async (req, res) => {
       [jsonStr, contract_id ?? null, report.id]
     );
 
-    await logAction(report.id, "UPDATE_DRAFT", req.user, null);
+    await logDwrAction({
+      reportId: report.id,
+      actionType: "UPDATED_DRAFT",
+      userId: req.user.id,
+      userRole: req.user.role,
+    });
 
     const updated = await getReportWithParsed(report.id);
     return res.json({ message: "Draft updated", report: updated });
@@ -339,35 +539,49 @@ router.put("/:id", authenticateJWT, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
-// DELETE /api/daily-work-reports/:id
-// Only deletes DRAFT reports
-router.delete("/:id", (req, res) => {
-  const reportId = req.params.id;
 
-  if (!reportId) {
-    return res.status(400).json({ message: "Report id is required." });
-  }
-
-  const sql =
-    "DELETE FROM daily_work_reports WHERE id = ? AND status = 'DRAFT'";
-
-  db.query(sql, [reportId], (err, result) => {
-    if (err) {
-      console.error("❌ Delete draft error:", err);
-      return res
-        .status(500)
-        .json({ message: "Failed to delete draft. Internal server error." });
+/**
+ * DELETE draft (Site Agent only) – Only deletes DRAFT
+ * DELETE /api/daily-work-reports/:id
+ */
+router.delete("/:id", authenticateJWT, async (req, res) => {
+  try {
+    if (!isRole(req.user, "siteagent")) {
+      return res.status(403).json({ message: "Only Site Agent can delete drafts" });
     }
 
-    if (result.affectedRows === 0) {
-      // Either doesn’t exist, or not DRAFT
-      return res.status(404).json({
-        message: "Draft not found, or cannot be deleted in its current status.",
+    const report = await getReport(req.params.id);
+    if (!report) {
+      return res.status(404).json({ message: "Draft not found" });
+    }
+
+    if (String(report.status) !== "DRAFT") {
+      return res.status(409).json({
+        message: "Draft cannot be deleted in its current status.",
       });
     }
 
+    const assignment = await getAssignment(report.project_id);
+    if (!assignment || String(assignment.siteagent_id) !== String(req.user.id)) {
+      return res.status(403).json({ message: "You are not the assigned Site Agent for this project" });
+    }
+
+    await db.query("DELETE FROM daily_work_reports WHERE id = ? AND status = 'DRAFT'", [
+      report.id,
+    ]);
+
+    await logDwrAction({
+      reportId: report.id,
+      actionType: "DELETED_DRAFT",
+      userId: req.user.id,
+      userRole: req.user.role,
+    });
+
     return res.json({ success: true, message: "Draft deleted successfully." });
-  });
+  } catch (err) {
+    console.error("❌ Delete draft error:", err);
+    return res.status(500).json({ message: "Failed to delete draft. Internal server error." });
+  }
 });
 
 /**
@@ -401,7 +615,13 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
       [nowSql(), report.id]
     );
 
-    await logAction(report.id, "SUBMIT", req.user, null);
+    await logDwrAction({
+      reportId: report.id,
+      actionType: "SUBMITTED",
+      userId: req.user.id,
+      userRole: req.user.role,
+      notes: req.body?.notes || null,
+    });
 
     const updated = await getReportWithParsed(report.id);
     return res.json({ message: "Submitted to Inspector", report: updated });
@@ -445,12 +665,75 @@ router.put("/:id/confirm", authenticateJWT, async (req, res) => {
       [nowSql(), report.id]
     );
 
-    await logAction(report.id, "CONFIRM", req.user, notes || null);
+    await logDwrAction({
+      reportId: report.id,
+      actionType: "INSPECTOR_APPROVED",
+      userId: req.user.id,
+      userRole: req.user.role,
+      notes: notes || null,
+    });
 
     const updated = await getReportWithParsed(report.id);
     return res.json({ message: "Confirmed by Inspector", report: updated });
   } catch (err) {
     console.error("❌ confirm error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+router.put("/:id/inspector-edit", authenticateJWT, async (req, res) => {
+  try {
+    // Only Inspector can edit at this stage
+    if (String(req.user.role).toLowerCase() !== "inspector") {
+      return res.status(403).json({ message: "Only Inspector can edit at this stage" });
+    }
+
+    const reportId = parseInt(req.params.id, 10);
+    if (Number.isNaN(reportId)) {
+      return res.status(400).json({ message: "Invalid report id" });
+    }
+
+    const report = await getReport(reportId);
+    if (!report) return res.status(404).json({ message: "Report not found" });
+
+    // Only SUBMITTED reports can be edited by Inspector
+    if (String(report.status) !== "SUBMITTED") {
+      return res.status(409).json({ message: "Only SUBMITTED reports can be edited by Inspector" });
+    }
+
+    // Must be assigned inspector for this project
+    const assignment = await getAssignment(report.project_id);
+    if (!assignment || String(assignment.inspector_id || "") !== String(req.user.id)) {
+      return res.status(403).json({ message: "You are not the assigned Inspector for this project" });
+    }
+
+    const { form_json, contract_id } = req.body || {};
+    if (form_json === undefined) {
+      return res.status(400).json({ message: "form_json is required" });
+    }
+
+    const jsonStr = safeJsonStringify(form_json);
+
+    await db.query(
+      `
+      UPDATE daily_work_reports
+      SET form_json = ?, contract_id = COALESCE(?, contract_id)
+      WHERE id = ?
+      `,
+      [jsonStr, contract_id ?? null, reportId]
+    );
+
+    // Log the edit
+    await logDwrAction({
+      reportId,
+      actionType: "INSPECTOR_EDITED",
+      userId: req.user.id,
+      userRole: req.user.role,
+    });
+
+    const updated = await getReportWithParsed(reportId);
+    return res.json({ message: "Inspector edit saved", report: updated });
+  } catch (err) {
+    console.error("❌ inspector-edit error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
@@ -489,7 +772,13 @@ router.put("/:id/are-approve", authenticateJWT, async (req, res) => {
       [nowSql(), report.id]
     );
 
-    await logAction(report.id, "ARE_APPROVE", req.user, notes || null);
+    await logDwrAction({
+      reportId: report.id,
+      actionType: "ARE_APPROVED",
+      userId: req.user.id,
+      userRole: req.user.role,
+      notes: notes || null,
+    });
 
     const updated = await getReportWithParsed(report.id);
     return res.json({ message: "Approved by ARE", report: updated });
@@ -524,7 +813,7 @@ router.put("/:id/re-approve", authenticateJWT, async (req, res) => {
 
     const { notes } = req.body || {};
 
-    // Ensure contract_id exists (THIS is the line you asked about — keep it)
+    // Ensure contract_id exists (keep this behavior)
     let contractId = report.contract_id;
 
     if (!contractId) {
@@ -534,16 +823,17 @@ router.put("/:id/re-approve", authenticateJWT, async (req, res) => {
       );
       if (cRows.length > 0) {
         contractId = cRows[0].id;
-        await db.query(
-          "UPDATE daily_work_reports SET contract_id = ? WHERE id = ?",
-          [contractId, report.id]
-        );
+        await db.query("UPDATE daily_work_reports SET contract_id = ? WHERE id = ?", [
+          contractId,
+          report.id,
+        ]);
       }
     }
 
     if (!contractId) {
       return res.status(400).json({
-        message: "Cannot seal report: contract_id missing and no contract found for this project",
+        message:
+          "Cannot seal report: contract_id missing and no contract found for this project",
       });
     }
 
@@ -565,7 +855,13 @@ router.put("/:id/re-approve", authenticateJWT, async (req, res) => {
       [nowSql(), report.id]
     );
 
-    await logAction(report.id, "RE_APPROVE", req.user, notes || null);
+    await logDwrAction({
+      reportId: report.id,
+      actionType: "RE_APPROVED",
+      userId: req.user.id,
+      userRole: req.user.role,
+      notes: notes || null,
+    });
 
     // 2) Upsert into approved_daily_forms (contract_id + form_date)
     const [existing] = await db.query(

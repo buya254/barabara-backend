@@ -3,6 +3,8 @@ const router = express.Router();
 const db = require("../db");
 const bcrypt = require("bcrypt");
 
+const authenticateJWT = require("../middlewares/auth");
+
 // These usernames should never show up in the frontend
 const excludedUsernames = ["phabade", "bmagenyi"];
 
@@ -231,83 +233,63 @@ router.post("/users", async (req, res) => {
 });
 
 /** UPDATE existing user */
-router.put("/users/:id", async (req, res) => {
-  const userId = req.params.id;
-  const {
-    username,
-    role,
-    region,
-    full_name,
-    email,
-    financial_year,
-    phone,
-    signature,
-  } = req.body;
-
+router.put("/users/:id", authenticateJWT, async (req, res) => {
   try {
+    const { full_name, email, phone, region, financial_year, role } = req.body;
+
     await db.query(
-      `UPDATE users
-      SET username = ?, role = ?, region = ?,full_name = ?, email = ?,  
-          financial_year = ?, phone = ?, signature = ?
-      WHERE id = ?`,
+      `
+      UPDATE users
+      SET
+        full_name      = COALESCE(?, full_name),
+        email          = COALESCE(?, email),
+        phone          = COALESCE(?, phone),
+        region         = COALESCE(?, region),
+        financial_year = COALESCE(?, financial_year),
+        role           = COALESCE(?, role)
+      WHERE id = ?
+      `,
       [
-        username,
-        role,
-        region,
-        full_name,
-        email,
-        financial_year,
-        phone,
-        signature,
-        userId,
+        full_name ?? null,
+        email ?? null,
+        phone ?? null,
+        region ?? null,
+        financial_year ?? null,
+        role ?? null,
+        req.params.id,
       ]
     );
 
-    res.json({ message: "User updated successfully" });
+    res.json({ success: true, message: "User updated" });
   } catch (err) {
-    console.error("Failed to update user:", err);
+    console.error("users update error:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
 /** RESET password to default */
-router.put("/users/:id", async (req, res) => {
+router.put("/users/reset_password/:id", async (req, res) => {
   const userId = req.params.id;
 
   try {
-    const allowed = [
-      "username",
-      "role",
-      "region",
-      "full_name",
-      "email",
-      "financial_year",
-      "phone",
-      "signature",
-    ];
+    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
 
-    const updates = [];
-    const values = [];
+    await db.query(
+      `
+      UPDATE users
+      SET password = ?, must_change_password = 1, password_updated_at = NULL
+      WHERE id = ?
+      `,
+      [passwordHash, userId]
+    );
 
-    for (const key of allowed) {
-      if (req.body[key] !== undefined) {
-        updates.push(`${key} = ?`);
-        values.push(req.body[key]);
-      }
-    }
-
-    if (updates.length === 0) {
-      return res.status(400).json({ message: "No valid fields to update" });
-    }
-
-    values.push(userId);
-
-    const sql = `UPDATE users SET ${updates.join(", ")} WHERE id = ?`;
-    await db.query(sql, values);
-
-    res.json({ message: "User updated successfully" });
+    res.json({
+      success: true,
+      message: "Password reset to default",
+      defaultPassword: DEFAULT_PASSWORD,
+    });
   } catch (err) {
-    console.error("Failed to update user:", err);
+    console.error("Failed to reset password:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
