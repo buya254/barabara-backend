@@ -1,6 +1,5 @@
 const express = require("express");
 const router = express.Router();
-
 const db = require("../db");
 const authenticateJWT = require("../middlewares/auth");
 
@@ -8,6 +7,78 @@ function isAdmin(user) {
   return String(user?.role || "").toLowerCase() === "admin";
 }
 
+router.get("/:id/roads", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return res.status(400).json({ message: "Invalid project id" });
+    }
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        id,
+        project_id,
+        project_name,
+        chainage_from,
+        chainage_to
+      FROM project_roads
+      WHERE project_id = ?
+      ORDER BY project_name
+      `,
+      [projectId]
+    );
+
+    return res.json({ success: true, roads: rows });
+  } catch (err) {
+    console.error("Error fetching project roads:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch roads for this project",
+    });
+  }
+});
+// POST /api/projects/:id/roads  -> add ONE road under a project
+router.post("/:id/roads", authenticateJWT, async (req, res) => {
+  try {
+    // Admin-only (match your projects admin rules)
+    if (!isAdmin(req.user)) {
+      return res.status(403).json({ message: "Admins only" });
+    }
+
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return res.status(400).json({ message: "Invalid project id" });
+    }
+
+    const { project_name, chainage_from, chainage_to } = req.body || {};
+
+    if (!project_name || String(project_name).trim().length === 0) {
+      return res.status(400).json({ message: "project_name is required" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO project_roads (project_id, project_name, chainage_from, chainage_to)
+      VALUES (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        chainage_from = VALUES(chainage_from),
+        chainage_to   = VALUES(chainage_to)
+      `,
+      [
+        projectId,
+        String(project_name).trim(),
+        chainage_from ? String(chainage_from).trim() : null,
+        chainage_to ? String(chainage_to).trim() : null,
+      ]
+    );
+
+    return res.json({ success: true, message: "Road saved" });
+  } catch (err) {
+    console.error("Error inserting road:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 /**
  * GET /api/projects?financial_year=2025/26
  */
@@ -40,7 +111,77 @@ router.get("/", authenticateJWT, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
+// GET /api/projects-paged?page=1&limit=10&project_name=&project_number=&region=&financial_year=
+router.get("/paged", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const limit = Math.max(parseInt(req.query.limit || "10", 10), 1);
+    const offset = (page - 1) * limit;
 
+    const {
+      project_name,
+      project_number,
+      region,
+      financial_year,
+    } = req.query;
+
+    const where = [];
+    const params = [];
+
+    if (project_name) {
+      where.push("(project_name LIKE ? OR name LIKE ?)");
+      params.push(`%${project_name}%`, `%${project_name}%`);
+    }
+    if (project_number) {
+      where.push("project_number LIKE ?");
+      params.push(`%${project_number}%`);
+    }
+    if (region) {
+      where.push("region = ?");
+      params.push(region);
+    }
+    if (financial_year) {
+      where.push("financial_year = ?");
+      params.push(financial_year);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    // total count
+    const [countRows] = await db.query(
+      `SELECT COUNT(*) AS total FROM projects ${whereSql}`,
+      params
+    );
+    const total = countRows?.[0]?.total || 0;
+    const totalPages = Math.max(Math.ceil(total / limit), 1);
+
+    // page rows
+    const [rows] = await db.query(
+      `
+      SELECT id, region, project_number, project_name, chainage, contractor, project_duration, financial_year
+      FROM projects
+      ${whereSql}
+      ORDER BY id DESC
+      LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    return res.json({
+      success: true,
+      projects: rows,
+      total,
+      page,
+      totalPages,
+    });
+  } catch (err) {
+    console.error("projects-paged error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch paged projects",
+    });
+  }
+});
 /**
  * POST /api/projects
  * body: { region, project_number, project_name, chainage,

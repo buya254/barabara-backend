@@ -94,65 +94,88 @@ router.post(
       // 👉 HERE is where we USE db INSIDE THE ROUTE:
       //    for each Excel row, either UPDATE existing row or INSERT a new one
 
+           // 👉 Insert / update the parent project (contract)
       for (const p of rowsToProcess) {
-        // 1. check if project already exists
-        const [existing] = await db.query(
-          `SELECT id
-             FROM projects
-            WHERE project_number = ?
-              AND project_name = ?
-              AND financial_year = ?
-            LIMIT 1`,
-          [p.project_number, p.project_name, p.financial_year]
+        // 1) Upsert into projects (contract-level)
+        await db.query(
+          `INSERT INTO projects
+             (region,
+              project_number,
+              name,
+              project_name,
+              chainage,
+              contractor,
+              project_duration,
+              financial_year)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             region           = VALUES(region),
+             name             = VALUES(name),
+             project_name     = VALUES(project_name),
+             chainage         = VALUES(chainage),
+             contractor       = VALUES(contractor),
+             project_duration = VALUES(project_duration),
+             financial_year   = VALUES(financial_year)`,
+          [
+            p.region,
+            p.project_number,
+            p.project_name,   // name (contract label)
+            p.project_name,   // project_name (for backward compatibility)
+            p.chainage,
+            p.contractor,
+            p.project_duration,
+            p.financial_year,
+          ]
         );
 
-        if (existing.length > 0) {
-          // 2a. UPDATE existing
-          await db.query(
-            `UPDATE projects
-                SET region = ?,
-                    chainage = ?,
-                    contractor = ?,
-                    project_duration = ?
-              WHERE id = ?`,
-            [
-              p.region,
-              p.chainage,
-              p.contractor,
-              p.project_duration,
-              existing[0].id,
-            ]
-          );
-        } else {
-          // 2b. INSERT new
-          await db.query(
-            `INSERT INTO projects
-               (region, project_number, project_name,
-                chainage, contractor, project_duration, financial_year)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-              p.region,
-              p.project_number,
-              p.project_name,
-              p.chainage,
-              p.contractor,
-              p.project_duration,
-              p.financial_year,
-            ]
-          );
-        }
-      }
+        // 2) Get the project.id we just inserted/updated
+        const [projRows] = await db.query(
+          "SELECT id FROM projects WHERE project_number = ? LIMIT 1",
+          [p.project_number]
+        );
 
+        if (!projRows.length) {
+          // Should not happen, but guard anyway
+          console.warn(
+            "No project row found after upsert for",
+            p.project_number
+          );
+          continue;
+        }
+
+        const projectId = projRows[0].id;
+
+        // 3) Upsert the road into project_roads
+        //    We keep chainage in chainage_from for now (we can split later)
+        await db.query(
+          `INSERT INTO project_roads
+             (project_id, project_name, chainage_from, chainage_to)
+           VALUES (?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             chainage_from = VALUES(chainage_from),
+             chainage_to   = VALUES(chainage_to)`,
+          [
+            projectId,
+            p.project_name,   // road name (matches template column)
+            p.chainage || null,
+            null,             // we’re not using chainage_to yet
+          ]
+        );
+      }
       res.json({
         success: true,
         message: `Processed ${rowsToProcess.length} projects from Excel.`,
       });
-    } catch (err) {
-      console.error("Error uploading projects:", err);
-      res.status(500).json({ message: "Failed to import projects" });
-    }
+     } catch (err) {
+    console.error("Error uploading projects:", err);
+
+    res.status(500).json({
+      message: "Failed to import projects",
+      error: err.message || null,
+      code: err.code || null,
+    });
   }
-);
+});
 
 /**
  * POST /api/import-projects/compare-projects
@@ -240,5 +263,32 @@ router.post(
     }
   }
 );
+        // GET /api/import-projects/all-projects
+        // Returns all projects for the View Projects modal
+        router.get("/all-projects", async (req, res) => {
+          try {
+            const [rows] = await db.query(
+              `
+              SELECT
+                id,
+                region,
+                project_number,
+                name,
+                project_name,
+                chainage,
+                contractor,
+                project_duration,
+                financial_year
+              FROM projects
+              ORDER BY region, project_number
+              `
+            );
+
+            res.json({ success: true, projects: rows });
+          } catch (err) {
+            console.error("Error fetching all projects:", err);
+            res.status(500).json({ success: false, message: "Failed to fetch projects" });
+          }
+        });
 
 module.exports = router;
