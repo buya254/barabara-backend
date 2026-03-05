@@ -18,6 +18,8 @@ const projectAccessRoute = require("./routes/projectAccess");
 const projectsRouter = require("./routes/projects");
 const importProjectsRoutes = require("./routes/importProjectsRoutes");
 const utilitiesRoutes = require("./routes/utilitiesRoute");
+const roadsRouter = require("./routes/roads");
+const importRoadsRoutes = require("./routes/importRoadsRoutes");
 
 
 
@@ -64,6 +66,8 @@ app.use("/api/project-access", projectAccessRoute);
 app.use("/api/projects", projectsRouter);
 app.use("/api/import-projects", importProjectsRoutes);
 app.use("/api/utilities", utilitiesRoutes);
+app.use("/api/roads", roadsRouter);
+app.use("/api/import-roads", importRoadsRoutes);
 
 
 
