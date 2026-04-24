@@ -84,9 +84,7 @@ router.post("/:id/roads", authenticateJWT, async (req, res) => {
  */
 router.get("/", authenticateJWT, async (req, res) => {
   try {
-    if (!isAdmin(req.user)) {
-      return res.status(403).json({ message: "Admins only" });
-    }
+    console.log("GET /api/projects req.user =", req.user);
 
     const { financial_year } = req.query;
     let sql = `
