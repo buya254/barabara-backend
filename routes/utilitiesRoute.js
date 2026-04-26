@@ -197,53 +197,58 @@ router.get("/user-projects/:userId", async (req, res) => {
 /**
  * GET /api/utilities/project-roads/:projectId
  */
-router.get("/project-roads/:projectId", (req, res) => {
-  const projectId = Number(req.params.projectId);
-  if (!Number.isInteger(projectId)) {
-    return res.status(400).json({ message: "Invalid project ID" });
-  }
+router.get("/project-roads/:projectId", async (req, res) => {
+  try {
+    console.log("HIT GET /api/utilities/project-roads/:projectId", req.params.projectId);
 
-  const sql = `
-    SELECT 
-      r.id,
-      r.road_code,
-      r.road_name,
-      r.town
-    FROM contracts c
-    JOIN contract_roads cr ON cr.contract_id = c.id
-    JOIN roads r ON r.id = cr.road_id
-    WHERE c.project_id = ?
-    ORDER BY r.town ASC, r.road_code ASC
-  `;
-
-  db.query(sql, [projectId], (err, rows) => {
-    if (err) {
-      console.error("Error loading project roads:", err);
-      return res.status(500).json({ message: "Failed to load roads for project" });
+    const projectId = Number(req.params.projectId);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: "Invalid project ID" });
     }
-    res.json(rows || []);
-  });
+
+    const sql = `
+      SELECT 
+        r.id,
+        r.road_code,
+        r.road_name,
+        r.town
+      FROM contracts c
+      JOIN contract_roads cr ON cr.contract_id = c.id
+      JOIN roads r ON r.id = cr.road_id
+      WHERE c.project_id = ?
+      ORDER BY r.town ASC, r.road_code ASC
+    `;
+
+    const [rows] = await db.query(sql, [projectId]);
+    return res.json(rows || []);
+  } catch (err) {
+    console.error("Error loading project roads:", err);
+    return res.status(500).json({ message: "Failed to load roads for project" });
+  }
 });
 
 /**
  * POST /api/utilities/package-roads
  */
-router.post("/package-roads", (req, res) => {
-  const projectId = Number(req.body.project_id);
-  const roadCodes = uniqueRoadCodes(req.body.road_codes);
-  const reset = parseBoolean(req.body.reset);
+router.post("/package-roads", async (req, res) => {
+  try {
+    console.log("HIT POST /api/utilities/package-roads", req.body);
 
-  if (!Number.isInteger(projectId) || roadCodes.length === 0) {
-    return res.status(400).json({
-      message: "project_id and a non-empty road_codes[] array are required",
-    });
-  }
+    const projectId = Number(req.body.project_id);
+    const roadCodes = uniqueRoadCodes(req.body.road_codes);
+    const reset = parseBoolean(req.body.reset);
 
-  db.query("SELECT project_number FROM projects WHERE id = ?", [projectId], (err, rows) => {
-    if (err) {
-      console.error("Error fetching project_number:", err);
-      return res.status(500).json({ message: "Failed to find project_number for project" });
+    if (!Number.isInteger(projectId) || roadCodes.length === 0) {
+      return res.status(400).json({
+        message: "project_id and a non-empty road_codes[] array are required",
+      });
     }
+
+    const [rows] = await db.query(
+      "SELECT project_number FROM projects WHERE id = ?",
+      [projectId]
+    );
+
     if (!rows || rows.length === 0) {
       return res.status(404).json({ message: "Project not found" });
     }
@@ -251,14 +256,20 @@ router.post("/package-roads", (req, res) => {
     const projectNumber = rows[0].project_number;
     const jsonRoadCodes = JSON.stringify(roadCodes);
 
-    db.query("CALL package_roads_to_contract(?, ?, ?)", [projectNumber, jsonRoadCodes, reset ? 1 : 0], (err2) => {
-      if (err2) {
-        console.error("Error packaging roads:", err2);
-        return res.status(500).json({ message: "Failed to package roads to project" });
-      }
-      return res.json({ success: true, message: "Roads packaged to project successfully", roadCodes });
+    await db.query(
+      "CALL package_roads_to_contract(?, ?, ?)",
+      [projectNumber, jsonRoadCodes, reset ? 1 : 0]
+    );
+
+    return res.json({
+      success: true,
+      message: "Roads packaged to project successfully",
+      roadCodes,
     });
-  });
+  } catch (err) {
+    console.error("Error packaging roads:", err);
+    return res.status(500).json({ message: "Failed to package roads to project" });
+  }
 });
 
 /**
