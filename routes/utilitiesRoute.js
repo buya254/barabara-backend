@@ -244,16 +244,40 @@ router.post("/package-roads", async (req, res) => {
       });
     }
 
-    const [rows] = await db.query(
+    const [projectRows] = await db.query(
       "SELECT project_number FROM projects WHERE id = ?",
       [projectId]
     );
 
-    if (!rows || rows.length === 0) {
+    if (!projectRows || projectRows.length === 0) {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    const projectNumber = rows[0].project_number;
+    // ✅ Validate against roads table first
+    const placeholders = roadCodes.map(() => "?").join(", ");
+    const [validRows] = await db.query(
+      `
+      SELECT UPPER(TRIM(road_code)) AS road_code
+      FROM roads
+      WHERE UPPER(TRIM(road_code)) IN (${placeholders})
+      `,
+      roadCodes
+    );
+
+    const validSet = new Set(
+      (validRows || []).map((r) => String(r.road_code || "").toUpperCase())
+    );
+
+    const invalidRoadCodes = roadCodes.filter((code) => !validSet.has(code));
+
+    if (invalidRoadCodes.length > 0) {
+      return res.status(400).json({
+        message: `These road codes do not exist in the roads table: ${invalidRoadCodes.join(", ")}`,
+        invalidRoadCodes,
+      });
+    }
+
+    const projectNumber = projectRows[0].project_number;
     const jsonRoadCodes = JSON.stringify(roadCodes);
 
     await db.query(
