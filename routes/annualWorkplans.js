@@ -1,8 +1,21 @@
 const express = require("express");
 const router = express.Router();
 
+const multer = require("multer");
+const ExcelJS = require("exceljs");
+const fs = require("fs");
+const path = require("path");
+
 const db = require("../db");
 const authenticateJWT = require("../middlewares/auth");
+
+const uploadDir = path.join(__dirname, "../uploads");
+
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
+}
+
+const upload = multer({ dest: uploadDir });
 
 router.use(authenticateJWT);
 
@@ -350,8 +363,8 @@ router.get("/:id/lines", async (req, res) => {
           r.road_code,
           r.road_name,
 
-          a.activity_code,
-          a.activity_description,
+          a.code AS activity_code,
+          a.name AS activity_description,
           a.unit,
 
           p.project_number,
@@ -366,9 +379,10 @@ router.get("/:id/lines", async (req, res) => {
         WHERE awl.workplan_id = ?
           AND awl.status <> 'cancelled'
         ORDER BY 
+         ORDER BY 
           p.project_number,
           r.road_code,
-          a.activity_code
+          a.code
       `,
       [id]
     );
@@ -713,8 +727,8 @@ router.get("/rates/list", async (req, res) => {
         ar.is_active,
         ar.created_at,
         ar.updated_at,
-        a.activity_code,
-        a.activity_description,
+        a.code AS activity_code,
+        a.name AS activity_description,
         a.unit
       FROM activity_rates ar
       INNER JOIN activities a
@@ -735,7 +749,7 @@ router.get("/rates/list", async (req, res) => {
     }
 
     sql += `
-      ORDER BY ar.financial_year DESC, ar.region, a.activity_code
+      ORDER BY ar.financial_year DESC, ar.region, a.code
     `;
 
     const [rows] = await db.query(sql, params);
@@ -746,6 +760,551 @@ router.get("/rates/list", async (req, res) => {
       message: "Failed to fetch activity rates",
       error: error.message,
     });
+  }
+});
+function getCellText(row, index) {
+  const value = row.getCell(index).value;
+
+  if (value === null || value === undefined) return "";
+
+  if (typeof value === "object") {
+    if (value.result !== undefined && value.result !== null) {
+      return String(value.result).trim();
+    }
+
+    if (value.text) {
+      return String(value.text).trim();
+    }
+
+    if (value.richText && Array.isArray(value.richText)) {
+      return value.richText.map((part) => part.text || "").join("").trim();
+    }
+
+    return String(value).trim();
+  }
+
+  return String(value).trim();
+}
+
+function getCellNumber(row, index) {
+  const text = getCellText(row, index);
+
+  if (!text) return null;
+
+  const cleaned = text.replace(/,/g, "").replace(/[^\d.-]/g, "");
+  const number = Number(cleaned);
+
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeFinancialYear(value) {
+  if (!value) return "";
+
+  const text = String(value).trim();
+
+  if (/^\d{4}\/\d{2}$/.test(text)) {
+    return text;
+  }
+
+  if (/^\d{4}-\d{4}$/.test(text)) {
+    return `${text.slice(0, 4)}/${text.slice(-2)}`;
+  }
+
+  return text;
+}
+
+function chainageToDecimal(value) {
+  if (value === null || value === undefined || value === "") return 0;
+
+  const text = String(value).trim();
+
+  if (!text) return 0;
+
+  if (text.includes("+")) {
+    const [kmPart, metrePart] = text.split("+");
+    const km = Number(kmPart || 0);
+    const metres = Number(metrePart || 0);
+
+    if (Number.isFinite(km) && Number.isFinite(metres)) {
+      return km + metres / 1000;
+    }
+  }
+
+  const number = Number(text.replace(/,/g, ""));
+
+  return Number.isFinite(number) ? number : 0;
+}
+function normalizeRoadCode(value) {
+  return String(value || "").trim();
+}
+
+function normalizeActivityCode(value) {
+  const text = String(value || "").trim();
+
+  const match = text.match(/^(\d{2})[-.](\d{2})[-.](\d{3})/);
+
+  if (match) {
+    return `${match[1]}-${match[2]}-${match[3]}`;
+  }
+
+  return text;
+}
+
+function looksLikeActivityCode(value) {
+  const text = String(value || "").trim();
+  return /^\d{2}[-.]\d{2}[-.]\d{3}/.test(text);
+}
+
+async function getOrCreateWorkplanId(connection, financialYear, region, title, createdBy) {
+  const [existing] = await connection.query(
+    `
+      SELECT id
+      FROM annual_workplans
+      WHERE financial_year = ? AND region = ?
+      LIMIT 1
+    `,
+    [financialYear, region]
+  );
+
+  if (existing.length > 0) {
+    return existing[0].id;
+  }
+
+  const [created] = await connection.query(
+    `
+      INSERT INTO annual_workplans (
+        financial_year,
+        region,
+        title,
+        created_by
+      )
+      VALUES (?, ?, ?, ?)
+    `,
+    [
+      financialYear,
+      region,
+      title || `${region} Annual Roads Workplan ${financialYear}`,
+      createdBy || null,
+    ]
+  );
+
+  return created.insertId;
+}
+
+async function upsertRoad(connection, road) {
+  const roadCode = normalizeRoadCode(road.road_code);
+  const roadName = String(road.road_name || "").trim();
+  const town = String(road.town || road.region || "Unknown").trim();
+  const region = String(road.region || "Coast").trim();
+
+  if (!roadCode) {
+    throw new Error("Cannot save road without road_code");
+  }
+
+  if (!roadName) {
+    throw new Error(`Cannot save road ${roadCode} without road_name`);
+  }
+
+  const [result] = await connection.query(
+    `
+      INSERT INTO roads (
+        road_code,
+        region,
+        town,
+        road_name,
+        surface_type,
+        condition_status,
+        road_length_km
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        id = LAST_INSERT_ID(id),
+        region = VALUES(region),
+        surface_type = VALUES(surface_type),
+        condition_status = VALUES(condition_status),
+        road_length_km = VALUES(road_length_km)
+    `,
+    [
+      roadCode,
+      region,
+      town,
+      roadName,
+      road.surface_type || null,
+      road.condition_status || null,
+      road.road_length_km || null,
+    ]
+  );
+
+  return result.insertId;
+}
+
+async function upsertActivity(connection, activity) {
+  const activityCode = normalizeActivityCode(activity.code);
+
+  if (!activityCode) {
+    throw new Error("Cannot save activity without code");
+  }
+
+  const [result] = await connection.query(
+    `
+      INSERT INTO activities (
+        code,
+        name,
+        unit
+      )
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        id = LAST_INSERT_ID(id),
+        name = VALUES(name),
+        unit = VALUES(unit)
+    `,
+    [
+      activityCode,
+      activity.name,
+      activity.unit || null,
+    ]
+  );
+
+  return result.insertId;
+}
+
+async function saveActivityRateIfClean(connection, rate, rateConflicts) {
+  const [existing] = await connection.query(
+    `
+      SELECT unit_rate
+      FROM activity_rates
+      WHERE activity_id = ?
+        AND financial_year = ?
+        AND region = ?
+      LIMIT 1
+    `,
+    [rate.activity_id, rate.financial_year, rate.region]
+  );
+
+  if (existing.length > 0) {
+    const oldRate = Number(existing[0].unit_rate);
+    const newRate = Number(rate.unit_rate);
+
+    if (Math.abs(oldRate - newRate) > 0.01) {
+      rateConflicts.push({
+        activity_code: rate.activity_code,
+        activity_name: rate.activity_name,
+        existing_rate: oldRate,
+        excel_rate: newRate,
+      });
+    }
+
+    return;
+  }
+
+  await connection.query(
+    `
+      INSERT INTO activity_rates (
+        activity_id,
+        financial_year,
+        region,
+        unit_rate,
+        source,
+        notes,
+        is_active
+      )
+      VALUES (?, ?, ?, ?, ?, ?, 1)
+    `,
+    [
+      rate.activity_id,
+      rate.financial_year,
+      rate.region,
+      rate.unit_rate,
+      "ARWP Excel",
+      "Imported from Annual Roads Workplan Excel",
+    ]
+  );
+}
+router.post("/import-arwp", upload.single("file"), async (req, res) => {
+  let connection;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        message: "Please upload an Excel file using the field name 'file'",
+      });
+    }
+
+    const financialYear = normalizeFinancialYear(
+      req.body.financial_year || "2025/26"
+    );
+
+    const region = req.body.region || "Coast";
+    const title =
+      req.body.title || `${region} Annual Roads Workplan ${financialYear}`;
+
+    const arwpSheetName = req.body.arwp_sheet || "ARWP FY 2025-2026";
+    const packagesSheetName = req.body.packages_sheet || "PACKAGES";
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(req.file.path);
+
+    const arwpSheet = workbook.getWorksheet(arwpSheetName);
+    const packagesSheet = workbook.getWorksheet(packagesSheetName);
+
+    if (!arwpSheet) {
+      return res.status(400).json({
+        message: `Sheet '${arwpSheetName}' was not found in the workbook`,
+      });
+    }
+
+    if (!packagesSheet) {
+      return res.status(400).json({
+        message: `Sheet '${packagesSheetName}' was not found in the workbook`,
+      });
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const createdBy = req.user?.id || null;
+
+    const workplanId = await getOrCreateWorkplanId(
+      connection,
+      financialYear,
+      region,
+      title,
+      createdBy
+    );
+
+    const packageMap = new Map();
+
+    packagesSheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+
+      const roadCode = normalizeRoadCode(getCellText(row, 2));
+      const roadName = getCellText(row, 3);
+
+      if (!roadCode || !roadName) return;
+
+      packageMap.set(roadCode, {
+        town: getCellText(row, 1) || null,
+        road_code: roadCode,
+        road_name: roadName,
+        surface_type: getCellText(row, 4) || null,
+        condition_status: getCellText(row, 5) || null,
+        road_length_km: getCellNumber(row, 6),
+        budget: getCellNumber(row, 7),
+        lot_no: getCellText(row, 8) || null,
+        category: getCellText(row, 9) || null,
+      });
+    });
+
+    let currentRoad = null;
+
+    let roadsCreatedOrUpdated = 0;
+    let activitiesCreatedOrUpdated = 0;
+    let ratesInserted = 0;
+    let linesInsertedOrUpdated = 0;
+    let skippedRows = 0;
+
+    const rateConflicts = [];
+
+    let arwpHeaderRow = 0;
+
+for (let rowNumber = 1; rowNumber <= arwpSheet.rowCount; rowNumber++) {
+  const row = arwpSheet.getRow(rowNumber);
+
+  const col1 = getCellText(row, 1).toLowerCase();
+  const col6 = getCellText(row, 6).toLowerCase();
+
+  if (col1 === "road code" && col6 === "activity code") {
+    arwpHeaderRow = rowNumber;
+    break;
+  }
+}
+
+const startRow = arwpHeaderRow > 0 ? arwpHeaderRow + 1 : 1;
+
+for (let rowNumber = startRow; rowNumber <= arwpSheet.rowCount; rowNumber++) {
+  const row = arwpSheet.getRow(rowNumber);
+
+  const possibleRoadCode = normalizeRoadCode(getCellText(row, 1));
+  const possibleRoadName = getCellText(row, 2);
+  const possibleSurfaceType = getCellText(row, 3);
+  const possibleCondition = getCellText(row, 4);
+  const possibleRoadLength = getCellNumber(row, 5);
+
+  const lowerRoadCode = possibleRoadCode.toLowerCase();
+
+  const isRealRoadRow =
+    possibleRoadCode &&
+    possibleRoadName &&
+    lowerRoadCode !== "road code" &&
+    !lowerRoadCode.startsWith("region:") &&
+    !lowerRoadCode.startsWith("district:") &&
+    !lowerRoadCode.includes("maintenance") &&
+    !lowerRoadCode.includes("subtotal") &&
+    !lowerRoadCode.includes("total");
+
+  if (isRealRoadRow) {
+    currentRoad = {
+      road_code: possibleRoadCode,
+      road_name: possibleRoadName,
+      surface_type: possibleSurfaceType || null,
+      condition_status: possibleCondition || null,
+      road_length_km: possibleRoadLength,
+    };
+  }
+
+  const rawActivityCode = getCellText(row, 6);
+  const activityCode = normalizeActivityCode(rawActivityCode);
+  const activityName = getCellText(row, 7);
+  const method = getCellText(row, 8);
+  const unit = getCellText(row, 9);
+
+  if (
+    !currentRoad ||
+    !activityCode ||
+    !activityName ||
+    !looksLikeActivityCode(rawActivityCode)
+  ) {
+    skippedRows++;
+    continue;
+  }
+
+  const plannedQuantity = getCellNumber(row, 10) || 0;
+  const fromChainage = chainageToDecimal(getCellText(row, 11));
+  const toChainage = chainageToDecimal(getCellText(row, 12));
+
+  const rateWithoutVat = getCellNumber(row, 14);
+  const rateWithVat = getCellNumber(row, 15);
+
+  const plannedRate = rateWithVat || rateWithoutVat || 0;
+
+  const packageInfo = packageMap.get(currentRoad.road_code);
+
+  const roadId = await upsertRoad(connection, {
+    road_code: currentRoad.road_code,
+    region,
+    town: packageInfo?.town || region,
+    road_name: currentRoad.road_name,
+    surface_type: currentRoad.surface_type || packageInfo?.surface_type || null,
+    condition_status:
+      currentRoad.condition_status || packageInfo?.condition_status || null,
+    road_length_km:
+      currentRoad.road_length_km || packageInfo?.road_length_km || null,
+  });
+
+  roadsCreatedOrUpdated++;
+
+  const activityId = await upsertActivity(connection, {
+    code: activityCode,
+    name: activityName,
+    unit,
+  });
+
+  activitiesCreatedOrUpdated++;
+
+  const beforeConflictCount = rateConflicts.length;
+
+  await saveActivityRateIfClean(
+    connection,
+    {
+      activity_id: activityId,
+      activity_code: activityCode,
+      activity_name: activityName,
+      financial_year: financialYear,
+      region,
+      unit_rate: plannedRate,
+    },
+    rateConflicts
+  );
+
+  if (rateConflicts.length === beforeConflictCount) {
+    ratesInserted++;
+  }
+
+  await connection.query(
+    `
+      INSERT INTO annual_workplan_lines (
+        workplan_id,
+        project_id,
+        road_id,
+        activity_id,
+        financial_year,
+        lot_no,
+        category,
+        method,
+        chainage_start,
+        chainage_end,
+        planned_quantity,
+        planned_rate,
+        remarks,
+        status
+      )
+      VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
+      ON DUPLICATE KEY UPDATE
+        lot_no = VALUES(lot_no),
+        category = VALUES(category),
+        method = VALUES(method),
+        planned_quantity = VALUES(planned_quantity),
+        planned_rate = VALUES(planned_rate),
+        remarks = VALUES(remarks),
+        status = 'draft'
+    `,
+    [
+      workplanId,
+      roadId,
+      activityId,
+      financialYear,
+      packageInfo?.lot_no || null,
+      packageInfo?.category || null,
+      method || null,
+      fromChainage,
+      toChainage,
+      plannedQuantity,
+      plannedRate,
+      `Imported from ${arwpSheetName}, row ${rowNumber}`,
+    ]
+  );
+
+  linesInsertedOrUpdated++;
+}
+
+    await connection.commit();
+
+    fs.unlink(req.file.path, () => {});
+
+    res.status(201).json({
+      message: "ARWP Excel imported successfully",
+      workplan_id: workplanId,
+      financial_year: financialYear,
+      region,
+      summary: {
+        roads_created_or_updated: roadsCreatedOrUpdated,
+        activities_created_or_updated: activitiesCreatedOrUpdated,
+        rates_checked_or_inserted: ratesInserted,
+        workplan_lines_inserted_or_updated: linesInsertedOrUpdated,
+        skipped_rows: skippedRows,
+        rate_conflicts: rateConflicts.length,
+      },
+      rate_conflicts: rateConflicts.slice(0, 20),
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    if (req.file?.path) {
+      fs.unlink(req.file.path, () => {});
+    }
+
+    console.error("Error importing ARWP Excel:", error);
+
+    res.status(500).json({
+      message: "Failed to import ARWP Excel",
+      error: error.message,
+    });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
