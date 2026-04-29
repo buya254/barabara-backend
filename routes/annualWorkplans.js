@@ -3,6 +3,7 @@ const router = express.Router();
 
 const multer = require("multer");
 const ExcelJS = require("exceljs");
+const XLSX = require("xlsx");
 const fs = require("fs");
 const path = require("path");
 
@@ -379,7 +380,6 @@ router.get("/:id/lines", async (req, res) => {
         WHERE awl.workplan_id = ?
           AND awl.status <> 'cancelled'
         ORDER BY 
-         ORDER BY 
           p.project_number,
           r.road_code,
           a.code
@@ -841,18 +841,13 @@ function normalizeRoadCode(value) {
 function normalizeActivityCode(value) {
   const text = String(value || "").trim();
 
-  const match = text.match(/^(\d{2})[-.](\d{2})[-.](\d{3})/);
+  if (!text) return "";
 
-  if (match) {
-    return `${match[1]}-${match[2]}-${match[3]}`;
-  }
-
-  return text;
+  return text.replace(/\s+/g, "").replace(/\./g, "-");
 }
-
 function looksLikeActivityCode(value) {
-  const text = String(value || "").trim();
-  return /^\d{2}[-.]\d{2}[-.]\d{3}/.test(text);
+  const text = normalizeActivityCode(value);
+  return /^\d{2}-\d{2}-\d{3}[A-Za-z0-9]*$/.test(text);
 }
 
 async function getOrCreateWorkplanId(connection, financialYear, region, title, createdBy) {
@@ -950,18 +945,24 @@ async function upsertActivity(connection, activity) {
       INSERT INTO activities (
         code,
         name,
-        unit
+        unit,
+        work_category,
+        work_description
       )
-      VALUES (?, ?, ?)
+      VALUES (?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         id = LAST_INSERT_ID(id),
         name = VALUES(name),
-        unit = VALUES(unit)
+        unit = COALESCE(VALUES(unit), unit),
+        work_category = COALESCE(VALUES(work_category), work_category),
+        work_description = COALESCE(VALUES(work_description), work_description)
     `,
     [
       activityCode,
       activity.name,
       activity.unit || null,
+      activity.work_category || null,
+      activity.work_description || null,
     ]
   );
 
@@ -971,7 +972,7 @@ async function upsertActivity(connection, activity) {
 async function saveActivityRateIfClean(connection, rate, rateConflicts) {
   const [existing] = await connection.query(
     `
-      SELECT unit_rate
+      SELECT unit_rate, direct_cost
       FROM activity_rates
       WHERE activity_id = ?
         AND financial_year = ?
@@ -990,9 +991,34 @@ async function saveActivityRateIfClean(connection, rate, rateConflicts) {
         activity_code: rate.activity_code,
         activity_name: rate.activity_name,
         existing_rate: oldRate,
-        excel_rate: newRate,
+        new_rate: newRate,
       });
     }
+
+    await connection.query(
+      `
+        UPDATE activity_rates
+        SET
+          direct_cost = ?,
+          unit_rate = ?,
+          source = ?,
+          notes = ?,
+          is_active = 1,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE activity_id = ?
+          AND financial_year = ?
+          AND region = ?
+      `,
+      [
+        rate.direct_cost || null,
+        rate.unit_rate,
+        rate.source || "KRB 2025",
+        rate.notes || "Imported from KRB Coast Region rate schedule",
+        rate.activity_id,
+        rate.financial_year,
+        rate.region,
+      ]
+    );
 
     return;
   }
@@ -1004,19 +1030,21 @@ async function saveActivityRateIfClean(connection, rate, rateConflicts) {
         financial_year,
         region,
         unit_rate,
+        direct_cost,
         source,
         notes,
         is_active
       )
-      VALUES (?, ?, ?, ?, ?, ?, 1)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
     `,
     [
       rate.activity_id,
       rate.financial_year,
       rate.region,
       rate.unit_rate,
-      "ARWP Excel",
-      "Imported from Annual Roads Workplan Excel",
+      rate.direct_cost || null,
+      rate.source || "KRB 2025",
+      rate.notes || "Imported from KRB Coast Region rate schedule",
     ]
   );
 }
@@ -1299,6 +1327,142 @@ for (let rowNumber = startRow; rowNumber <= arwpSheet.rowCount; rowNumber++) {
 
     res.status(500).json({
       message: "Failed to import ARWP Excel",
+      error: error.message,
+    });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.post("/import-krb-rates-excel", upload.single("file"), async (req, res) => {
+  let connection;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        message: "Please upload the KRB rates Excel file using the field name 'file'",
+      });
+    }
+
+    const financialYear = normalizeFinancialYear(
+      req.body.financial_year || "2025/26"
+    );
+
+    const region = req.body.region || "Coast";
+    const sheetName = req.body.sheet || "KRB_Rates_2025_Coast";
+
+    const workbook = XLSX.readFile(req.file.path);
+    const sheet = workbook.Sheets[sheetName];
+
+    if (!sheet) {
+      return res.status(400).json({
+        message: `Sheet '${sheetName}' was not found in the workbook`,
+        available_sheets: workbook.SheetNames,
+      });
+    }
+
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      defval: "",
+      raw: false,
+    });
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    let activitiesImported = 0;
+    let ratesImported = 0;
+    let skippedRows = 0;
+    const rateConflicts = [];
+
+    for (const row of rows) {
+      const workCategory = String(row["Work Category"] || "").trim();
+      const code = normalizeActivityCode(row["Code"]);
+      const workItem = String(row["Work Item"] || "").trim();
+      const workDescription = String(row["Work Description"] || "").trim();
+      const unit = String(row["Unit"] || "").trim();
+
+      const directCost = Number(
+        String(row["Direct Cost"] || "")
+          .replace(/,/g, "")
+          .replace(/[^\d.-]/g, "")
+      );
+
+      const unitRate = Number(
+        String(row["Unit Rate"] || "")
+          .replace(/,/g, "")
+          .replace(/[^\d.-]/g, "")
+      );
+
+      if (
+        !code ||
+        !workItem ||
+        !looksLikeActivityCode(code) ||
+        !Number.isFinite(unitRate)
+      ) {
+        skippedRows++;
+        continue;
+      }
+
+      const activityId = await upsertActivity(connection, {
+        code,
+        name: workItem,
+        unit,
+        work_category: workCategory,
+        work_description: workDescription,
+      });
+
+      activitiesImported++;
+
+      await saveActivityRateIfClean(
+        connection,
+        {
+          activity_id: activityId,
+          activity_code: code,
+          activity_name: workItem,
+          financial_year: financialYear,
+          region,
+          direct_cost: Number.isFinite(directCost) ? directCost : null,
+          unit_rate: unitRate,
+          source: "KRB 2025",
+          notes: "Imported from cleaned KRB Coast Region rates workbook",
+        },
+        rateConflicts
+      );
+
+      ratesImported++;
+    }
+
+    await connection.commit();
+
+    fs.unlink(req.file.path, () => {});
+
+    res.status(201).json({
+      message: "KRB rates imported successfully",
+      financial_year: financialYear,
+      region,
+      summary: {
+        activities_imported_or_updated: activitiesImported,
+        rates_imported_or_updated: ratesImported,
+        skipped_rows: skippedRows,
+        rate_conflicts: rateConflicts.length,
+      },
+      rate_conflicts: rateConflicts.slice(0, 20),
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    if (req.file?.path) {
+      fs.unlink(req.file.path, () => {});
+    }
+
+    console.error("Error importing KRB rates:", error);
+
+    res.status(500).json({
+      message: "Failed to import KRB rates",
       error: error.message,
     });
   } finally {
