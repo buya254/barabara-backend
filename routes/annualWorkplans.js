@@ -360,6 +360,11 @@ router.get("/:id/lines", async (req, res) => {
           awl.planned_amount,
           awl.remarks,
           awl.status,
+          awl.is_ignored,
+          awl.line_type,
+          awl.ignored_reason,
+          awl.ignored_by,
+          awl.ignored_at,    
 
           r.road_code,
           r.road_name,
@@ -1471,5 +1476,512 @@ router.post("/import-krb-rates-excel", upload.single("file"), async (req, res) =
     }
   }
 });
+/**
+ * GET /api/annual-workplans/:id/lots
+ * Shows ARWP grouped by lot/category for RE linking.
+ */
+router.get("/:id/lots", async (req, res) => {
+  try {
+    const { id } = req.params;
 
+    const [rows] = await db.query(
+      `
+        SELECT
+          awl.workplan_id,
+          awl.lot_no,
+          awl.category,
+
+          COUNT(*) AS line_count,
+          COUNT(DISTINCT awl.road_id) AS road_count,
+
+          SUM(CASE WHEN awl.is_ignored = 1 THEN 1 ELSE 0 END) AS ignored_line_count,
+          SUM(CASE WHEN awl.is_ignored = 0 THEN 1 ELSE 0 END) AS active_line_count,
+
+          COALESCE(
+            SUM(
+              CASE 
+                WHEN awl.is_ignored = 0 THEN awl.planned_amount 
+                ELSE 0 
+              END
+            ),
+            0
+          ) AS active_planned_amount,
+
+          awpl.project_id AS linked_project_id,
+          p.project_number AS linked_project_number,
+          p.project_name AS linked_project_name
+
+        FROM annual_workplan_lines awl
+
+        LEFT JOIN annual_workplan_project_lots awpl
+          ON awpl.workplan_id = awl.workplan_id
+          AND awpl.lot_no = awl.lot_no
+          AND awpl.category = awl.category
+
+        LEFT JOIN projects p
+          ON p.id = awpl.project_id
+
+        WHERE awl.workplan_id = ?
+          AND awl.status <> 'cancelled'
+          AND awl.lot_no IS NOT NULL
+          AND awl.category IS NOT NULL
+
+        GROUP BY
+          awl.workplan_id,
+          awl.lot_no,
+          awl.category,
+          awpl.project_id,
+          p.project_number,
+          p.project_name
+
+        ORDER BY
+          CAST(awl.lot_no AS UNSIGNED),
+          awl.lot_no,
+          awl.category
+      `,
+      [id]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Error fetching ARWP lots:", error);
+    res.status(500).json({
+      message: "Failed to fetch ARWP lots",
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/annual-workplans/link-lot-to-project
+ * Links one ARWP lot/category to a project managed by the Projects module.
+ */
+router.post("/link-lot-to-project", async (req, res) => {
+  let connection;
+
+  try {
+    const { workplan_id, lot_no, category, project_id } = req.body;
+
+    if (!workplan_id || !lot_no || !category || !project_id) {
+      return res.status(400).json({
+        message: "workplan_id, lot_no, category, and project_id are required",
+      });
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [projectRows] = await connection.query(
+      `
+        SELECT id, project_number, project_name, region, financial_year
+        FROM projects
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [project_id]
+    );
+
+    if (projectRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        message: "Project not found",
+      });
+    }
+
+    const project = projectRows[0];
+
+    const [lineRows] = await connection.query(
+      `
+        SELECT COUNT(*) AS total_lines
+        FROM annual_workplan_lines
+        WHERE workplan_id = ?
+          AND lot_no = ?
+          AND category = ?
+          AND status <> 'cancelled'
+          AND is_ignored = 0
+      `,
+      [workplan_id, lot_no, category]
+    );
+
+    if (Number(lineRows[0].total_lines) === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        message: "No active ARWP lines found for this lot/category",
+      });
+    }
+
+    await connection.query(
+      `
+        INSERT INTO annual_workplan_project_lots (
+          workplan_id,
+          lot_no,
+          category,
+          project_id
+        )
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          project_id = VALUES(project_id),
+          updated_at = CURRENT_TIMESTAMP
+      `,
+      [workplan_id, lot_no, category, project_id]
+    );
+
+    const [updatedLines] = await connection.query(
+      `
+        UPDATE annual_workplan_lines
+        SET project_id = ?
+        WHERE workplan_id = ?
+          AND lot_no = ?
+          AND category = ?
+          AND status <> 'cancelled'
+          AND is_ignored = 0
+      `,
+      [project_id, workplan_id, lot_no, category]
+    );
+
+    const [insertedRoads] = await connection.query(
+      `
+        INSERT INTO project_roads (
+          project_id,
+          road_id,
+          project_name,
+          chainage_from,
+          chainage_to
+        )
+        SELECT
+          ? AS project_id,
+          awl.road_id,
+          ? AS project_name,
+          CAST(MIN(awl.chainage_start) AS CHAR) AS chainage_from,
+          CAST(MAX(awl.chainage_end) AS CHAR) AS chainage_to
+        FROM annual_workplan_lines awl
+        WHERE awl.workplan_id = ?
+          AND awl.lot_no = ?
+          AND awl.category = ?
+          AND awl.status <> 'cancelled'
+          AND awl.is_ignored = 0
+        GROUP BY awl.road_id
+        ON DUPLICATE KEY UPDATE
+          project_name = VALUES(project_name),
+          chainage_from = VALUES(chainage_from),
+          chainage_to = VALUES(chainage_to)
+      `,
+      [project_id, project.project_name, workplan_id, lot_no, category]
+    );
+
+    const [rateVariationRows] = await connection.query(
+      `
+        SELECT 
+          awl.activity_id,
+          COUNT(DISTINCT awl.planned_rate) AS distinct_rates
+        FROM annual_workplan_lines awl
+        WHERE awl.workplan_id = ?
+          AND awl.lot_no = ?
+          AND awl.category = ?
+          AND awl.status <> 'cancelled'
+          AND awl.is_ignored = 0
+        GROUP BY awl.activity_id
+        HAVING COUNT(DISTINCT awl.planned_rate) > 1
+      `,
+      [workplan_id, lot_no, category]
+    );
+
+    const [contractRates] = await connection.query(
+      `
+        INSERT INTO contract_activity_rates (
+          project_id,
+          activity_id,
+          financial_year,
+          region,
+          contractor_rate,
+          krb_rate_at_tender,
+          source,
+          notes
+        )
+        SELECT
+          ? AS project_id,
+          awl.activity_id,
+          awl.financial_year,
+          aw.region,
+          MAX(awl.planned_rate) AS contractor_rate,
+          MAX(ar.unit_rate) AS krb_rate_at_tender,
+          'Successful Bidder ARWP' AS source,
+          CONCAT(
+            'Copied from ARWP workplan ',
+            awl.workplan_id,
+            ', lot ',
+            awl.lot_no,
+            ', category ',
+            awl.category
+          ) AS notes
+        FROM annual_workplan_lines awl
+        INNER JOIN annual_workplans aw
+          ON aw.id = awl.workplan_id
+        LEFT JOIN activity_rates ar
+          ON ar.activity_id = awl.activity_id
+          AND ar.financial_year = awl.financial_year
+          AND ar.region = aw.region
+        WHERE awl.workplan_id = ?
+          AND awl.lot_no = ?
+          AND awl.category = ?
+          AND awl.status <> 'cancelled'
+          AND awl.is_ignored = 0
+        GROUP BY
+          awl.activity_id,
+          awl.financial_year,
+          aw.region,
+          awl.workplan_id,
+          awl.lot_no,
+          awl.category
+        ON DUPLICATE KEY UPDATE
+          contractor_rate = VALUES(contractor_rate),
+          krb_rate_at_tender = VALUES(krb_rate_at_tender),
+          source = VALUES(source),
+          notes = VALUES(notes),
+          updated_at = CURRENT_TIMESTAMP
+      `,
+      [project_id, workplan_id, lot_no, category]
+    );
+
+    await connection.commit();
+
+    res.json({
+      message: "ARWP lot linked to project successfully",
+      workplan_id,
+      lot_no,
+      category,
+      project_id,
+      project_name: project.project_name,
+      summary: {
+        lines_updated: updatedLines.affectedRows,
+        project_roads_inserted_or_updated: insertedRoads.affectedRows,
+        contract_rates_inserted_or_updated: contractRates.affectedRows,
+        rate_variation_warnings: rateVariationRows.length,
+      },
+      rate_variations: rateVariationRows,
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    console.error("Error linking ARWP lot to project:", error);
+
+    res.status(500).json({
+      message: "Failed to link ARWP lot to project",
+      error: error.message,
+    });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+/**
+ * GET /api/annual-workplans/:id/unassigned-roads
+ * Shows roads with ARWP lines that are missing lot/category.
+ */
+router.get("/:id/unassigned-roads", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [rows] = await db.query(
+      `
+        SELECT
+          awl.workplan_id,
+          awl.road_id,
+          r.road_code,
+          r.road_name,
+          r.region,
+          r.town,
+
+          COUNT(*) AS line_count,
+          COALESCE(SUM(awl.planned_amount), 0) AS total_planned_amount,
+
+          SUM(CASE WHEN awl.is_ignored = 1 THEN 1 ELSE 0 END) AS ignored_line_count,
+          SUM(CASE WHEN awl.is_ignored = 0 THEN 1 ELSE 0 END) AS active_line_count,
+
+          MIN(awl.id) AS first_line_id,
+          MAX(awl.id) AS last_line_id
+
+        FROM annual_workplan_lines awl
+        INNER JOIN roads r
+          ON r.id = awl.road_id
+
+        WHERE awl.workplan_id = ?
+          AND awl.status <> 'cancelled'
+          AND (
+            awl.lot_no IS NULL
+            OR awl.category IS NULL
+          )
+
+        GROUP BY
+          awl.workplan_id,
+          awl.road_id,
+          r.road_code,
+          r.road_name,
+          r.region,
+          r.town
+
+        ORDER BY
+          r.town,
+          r.road_code,
+          r.road_name
+      `,
+      [id]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Error fetching unassigned ARWP roads:", error);
+    res.status(500).json({
+      message: "Failed to fetch unassigned ARWP roads",
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/annual-workplans/ignore-road
+ * Marks all ARWP lines for a road as ignored/omitted.
+ */
+router.post("/ignore-road", async (req, res) => {
+  try {
+    const { workplan_id, road_id, reason } = req.body;
+
+    if (!workplan_id || !road_id || !reason) {
+      return res.status(400).json({
+        message: "workplan_id, road_id, and reason are required",
+      });
+    }
+
+    const ignoredBy = req.user?.id || null;
+
+    const [result] = await db.query(
+      `
+        UPDATE annual_workplan_lines
+        SET
+          is_ignored = 1,
+          ignored_reason = ?,
+          ignored_by = ?,
+          ignored_at = CURRENT_TIMESTAMP
+        WHERE workplan_id = ?
+          AND road_id = ?
+          AND status <> 'cancelled'
+      `,
+      [reason, ignoredBy, workplan_id, road_id]
+    );
+
+    res.json({
+      message: "ARWP road ignored successfully",
+      workplan_id,
+      road_id,
+      affected_lines: result.affectedRows,
+    });
+  } catch (error) {
+    console.error("Error ignoring ARWP road:", error);
+    res.status(500).json({
+      message: "Failed to ignore ARWP road",
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/annual-workplans/unignore-road
+ * Restores all ignored ARWP lines for a road.
+ */
+router.post("/unignore-road", async (req, res) => {
+  try {
+    const { workplan_id, road_id } = req.body;
+
+    if (!workplan_id || !road_id) {
+      return res.status(400).json({
+        message: "workplan_id and road_id are required",
+      });
+    }
+
+    const [result] = await db.query(
+      `
+        UPDATE annual_workplan_lines
+        SET
+          is_ignored = 0,
+          ignored_reason = NULL,
+          ignored_by = NULL,
+          ignored_at = NULL
+        WHERE workplan_id = ?
+          AND road_id = ?
+          AND status <> 'cancelled'
+      `,
+      [workplan_id, road_id]
+    );
+
+    res.json({
+      message: "ARWP road restored successfully",
+      workplan_id,
+      road_id,
+      affected_lines: result.affectedRows,
+    });
+  } catch (error) {
+    console.error("Error restoring ARWP road:", error);
+    res.status(500).json({
+      message: "Failed to restore ARWP road",
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * PUT /api/annual-workplans/lines/:lineId/type
+ * Classifies a line as ROAD_WORK, PRELIMINARIES, SITE_BUILDING, etc.
+ */
+router.put("/lines/:lineId/type", async (req, res) => {
+  try {
+    const { lineId } = req.params;
+    const { line_type } = req.body;
+
+    const allowedTypes = [
+      "ROAD_WORK",
+      "PRELIMINARIES",
+      "SITE_BUILDING",
+      "GENERAL_ITEM",
+      "PROVISIONAL_SUM",
+    ];
+
+    if (!allowedTypes.includes(line_type)) {
+      return res.status(400).json({
+        message: "Invalid line_type",
+        allowedTypes,
+      });
+    }
+
+    const [result] = await db.query(
+      `
+        UPDATE annual_workplan_lines
+        SET line_type = ?
+        WHERE id = ?
+      `,
+      [line_type, lineId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        message: "Annual workplan line not found",
+      });
+    }
+
+    res.json({
+      message: "Line type updated successfully",
+      line_id: lineId,
+      line_type,
+    });
+  } catch (error) {
+    console.error("Error updating line type:", error);
+    res.status(500).json({
+      message: "Failed to update line type",
+      error: error.message,
+    });
+  }
+});
 module.exports = router;
