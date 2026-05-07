@@ -1984,4 +1984,43 @@ router.put("/lines/:lineId/type", async (req, res) => {
     });
   }
 });
+// GET /api/annual-workplans/active?financial_year=2025/26&region=Coast
+router.get("/active/by-region", async (req, res) => {
+  try {
+    const { financial_year, region } = req.query;
+
+    if (!financial_year || !region) {
+      return res.status(400).json({
+        message: "financial_year and region are required",
+      });
+    }
+
+    const [rows] = await db.query(
+      `
+        SELECT *
+        FROM annual_workplans
+        WHERE financial_year = ?
+          AND region = ?
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [financial_year, region]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        message: "No annual workplan found for this financial year and region",
+      });
+    }
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("Error fetching active regional ARWP:", error);
+    res.status(500).json({
+      message: "Failed to fetch active regional ARWP",
+      error: error.message,
+    });
+  }
+});
+
 module.exports = router;
