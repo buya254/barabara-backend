@@ -174,19 +174,23 @@ router.get("/assignment-projects", async (req, res) => {
         awpl.lot_no,
         awpl.category
 
-      FROM annual_workplans aw
+            FROM annual_workplans aw
       INNER JOIN annual_workplan_project_lots awpl
         ON awpl.workplan_id = aw.id
       INNER JOIN projects p
         ON p.id = awpl.project_id
+      LEFT JOIN user_projects up
+        ON up.project_id = p.id
+        AND up.user_id = ?
 
       WHERE LOWER(TRIM(aw.region)) = LOWER(TRIM(?))
+        AND up.project_id IS NULL
 
       ORDER BY
         p.project_number ASC,
         p.project_name ASC
       `,
-      [selectedUser.region]
+      [userId, selectedUser.region]
     );
 
     const filteredProjects = (rows || []).filter((project) => {
