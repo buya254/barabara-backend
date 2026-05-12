@@ -919,10 +919,12 @@ async function upsertRoad(connection, road) {
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         id = LAST_INSERT_ID(id),
-        region = VALUES(region),
-        surface_type = VALUES(surface_type),
-        condition_status = VALUES(condition_status),
-        road_length_km = VALUES(road_length_km)
+        region = COALESCE(VALUES(region), region),
+        town = COALESCE(NULLIF(VALUES(town), ''), town),
+        road_name = COALESCE(NULLIF(VALUES(road_name), ''), road_name),
+        surface_type = COALESCE(VALUES(surface_type), surface_type),
+        condition_status = COALESCE(VALUES(condition_status), condition_status),
+        road_length_km = COALESCE(VALUES(road_length_km), road_length_km)
     `,
     [
       roadCode,
@@ -1668,6 +1670,82 @@ router.post("/link-lot-to-project", async (req, res) => {
       `,
       [project_id, project.project_name, workplan_id, lot_no, category]
     );
+        // Create/fetch contract for this project.
+    // This is the proper package container used by contract_roads.
+    await connection.query(
+      `
+        INSERT INTO contracts (
+          contract_name,
+          project_id,
+          financial_year
+        )
+        SELECT
+          ? AS contract_name,
+          ? AS project_id,
+          ? AS financial_year
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM contracts
+          WHERE project_id = ?
+        )
+      `,
+      [
+        project.project_number,
+        project_id,
+        project.financial_year,
+        project_id,
+      ]
+    );
+
+    const [contractRows] = await connection.query(
+      `
+        SELECT id
+        FROM contracts
+        WHERE project_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [project_id]
+    );
+
+    if (contractRows.length === 0) {
+      await connection.rollback();
+      return res.status(500).json({
+        message: "Could not create or find contract for this project",
+      });
+    }
+
+    const contractId = contractRows[0].id;
+
+    // Insert distinct ARWP roads into contract_roads.
+    // This feeds Manage Projects → View Roads.
+    const [contractRoads] = await connection.query(
+      `
+        INSERT INTO contract_roads (
+          contract_id,
+          road_id,
+          is_active
+        )
+        SELECT DISTINCT
+          ? AS contract_id,
+          awl.road_id,
+          1 AS is_active
+        FROM annual_workplan_lines awl
+        WHERE awl.workplan_id = ?
+          AND awl.lot_no = ?
+          AND awl.category = ?
+          AND awl.status <> 'cancelled'
+          AND awl.is_ignored = 0
+          AND awl.road_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM contract_roads cr
+            WHERE cr.contract_id = ?
+              AND cr.road_id = awl.road_id
+          )
+      `,
+      [contractId, workplan_id, lot_no, category, contractId]
+    );
 
     const [rateVariationRows] = await connection.query(
       `
@@ -1755,6 +1833,8 @@ router.post("/link-lot-to-project", async (req, res) => {
       summary: {
         lines_updated: updatedLines.affectedRows,
         project_roads_inserted_or_updated: insertedRoads.affectedRows,
+        contract_id: contractId,
+        contract_roads_inserted: contractRoads.affectedRows,
         contract_rates_inserted_or_updated: contractRates.affectedRows,
         rate_variation_warnings: rateVariationRows.length,
       },

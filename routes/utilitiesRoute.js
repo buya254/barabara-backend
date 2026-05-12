@@ -633,63 +633,64 @@ router.post("/set-user-financial-year", (req, res) => {
 
 // ✅ GET /api/utilities/activities
 // Works even if your table columns differ (unit missing, etc.)
-router.get("/activities", (req, res) => {
-  // 1) confirm table exists
-  db.query("SHOW TABLES LIKE 'activities'", (errT, tables) => {
-    if (errT) {
-      console.error("SHOW TABLES error:", errT);
-      return res.status(500).json({ message: "Failed to check activities table" });
-    }
+// ✅ GET /api/utilities/activities
+// Loads all available road-work activities for Utilities.
+router.get("/activities", async (req, res) => {
+  try {
+    const [tables] = await db.query("SHOW TABLES LIKE 'activities'");
 
     if (!tables || tables.length === 0) {
       return res.status(500).json({
         message:
-          "Table `activities` not found. Confirm the real table name in your DB (maybe activity_list / work_activities) and update this route.",
+          "Table `activities` not found. Confirm the real table name in your DB.",
       });
     }
 
-    // 2) inspect columns so we pick the right ones
-    db.query("SHOW COLUMNS FROM activities", (errC, cols) => {
-      if (errC) {
-        console.error("SHOW COLUMNS error:", errC);
-        return res.status(500).json({ message: "Failed to inspect activities table" });
-      }
+    const [cols] = await db.query("SHOW COLUMNS FROM activities");
 
-      const fields = (cols || []).map((c) => String(c.Field || "").toLowerCase());
-      const has = (name) => fields.includes(String(name).toLowerCase());
-      const pick = (options) => options.find((o) => has(o)) || null;
+    const fields = (cols || []).map((c) =>
+      String(c.Field || "").toLowerCase()
+    );
 
-      const idCol = pick(["id", "activity_id"]);
-      const codeCol = pick(["code", "activity_code", "act_code"]);
-      const nameCol = pick(["name", "activity_name", "act_name", "description"]);
-      const unitCol = pick(["unit", "uom", "unit_of_measure"]);
+    const has = (name) => fields.includes(String(name).toLowerCase());
 
-      if (!idCol || !codeCol || !nameCol) {
-        return res.status(500).json({
-          message: "Activities table columns not recognized (need id + code + name).",
-          found_columns: fields,
-        });
-      }
+    const pick = (options) => options.find((o) => has(o)) || null;
 
-      const sql = `
-        SELECT
-          ${idCol}  AS id,
-          ${codeCol} AS code,
-          ${nameCol} AS name,
-          ${unitCol ? unitCol : "NULL"} AS unit
-        FROM activities
-        ORDER BY code ASC
-      `;
+    const idCol = pick(["id", "activity_id"]);
+    const codeCol = pick(["code", "activity_code", "act_code"]);
+    const nameCol = pick(["name", "activity_name", "act_name", "description"]);
+    const unitCol = pick(["unit", "uom", "unit_of_measure"]);
 
-      db.query(sql, (errQ, rows) => {
-        if (errQ) {
-          console.error("Activities query error:", errQ);
-          return res.status(500).json({ message: "Failed to load activities" });
-        }
-        return res.json(rows || []);
+    if (!idCol || !codeCol || !nameCol) {
+      return res.status(500).json({
+        message: "Activities table columns not recognized. Need id + code + name.",
+        found_columns: fields,
       });
+    }
+
+    const sql = `
+      SELECT
+        ${idCol} AS id,
+        ${codeCol} AS code,
+        ${nameCol} AS name,
+        ${unitCol ? unitCol : "NULL"} AS unit
+      FROM activities
+      ORDER BY ${codeCol} ASC
+    `;
+
+    const [rows] = await db.query(sql);
+
+    return res.json(rows || []);
+  } catch (err) {
+    console.error("Activities route error:", err);
+
+    return res.status(500).json({
+      message: "Failed to load activities",
+      error: err.message,
+      code: err.code || null,
+      sqlMessage: err.sqlMessage || null,
     });
-  });
+  }
 });
 
 module.exports = router;

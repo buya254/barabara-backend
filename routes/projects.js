@@ -10,6 +10,7 @@ function isAdmin(user) {
 router.get("/:id/roads", authenticateJWT, async (req, res) => {
   try {
     const projectId = parseInt(req.params.id, 10);
+
     if (Number.isNaN(projectId)) {
       return res.status(400).json({ message: "Invalid project id" });
     }
@@ -17,27 +18,48 @@ router.get("/:id/roads", authenticateJWT, async (req, res) => {
     const [rows] = await db.query(
       `
       SELECT
-        id,
-        project_id,
-        project_name,
-        chainage_from,
-        chainage_to
-      FROM project_roads
-      WHERE project_id = ?
-      ORDER BY project_name
+        r.id AS id,
+        r.id AS road_id,
+        c.project_id,
+        c.id AS contract_id,
+        c.contract_name,
+
+        r.road_code,
+        r.road_name,
+        r.town,
+        r.region,
+        r.road_length_km,
+
+        NULL AS chainage_from,
+        NULL AS chainage_to
+      FROM contracts c
+      INNER JOIN contract_roads cr
+        ON cr.contract_id = c.id
+      INNER JOIN roads r
+        ON r.id = cr.road_id
+      WHERE c.project_id = ?
+        AND cr.is_active = 1
+      ORDER BY
+        r.road_code,
+        r.road_name
       `,
       [projectId]
     );
 
-    return res.json({ success: true, roads: rows });
+    return res.json({
+      success: true,
+      roads: rows,
+    });
   } catch (err) {
     console.error("Error fetching project roads:", err);
+
     return res.status(500).json({
       success: false,
       message: "Failed to fetch roads for this project",
     });
   }
 });
+
 // POST /api/projects/:id/roads  -> add ONE road under a project
 router.post("/:id/roads", authenticateJWT, async (req, res) => {
   try {
