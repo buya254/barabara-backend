@@ -45,7 +45,9 @@ function toStoredFinancialYear(fyKey) {
   const [startYY, endYY] = fyKey.split("/");
   return `20${startYY}/${endYY}`; // "2025/26"
 }
-
+function toFYEnd(raw) {
+  return extractFYEnd(raw);
+}
 function parseBoolean(value) {
   return value === true || value === 1 || value === "1" || value === "true";
 }
@@ -90,13 +92,79 @@ function uniquePositiveIntegers(values) {
   ];
 }
 /**
+ * GET /api/utilities/users-by-financial-year?financial_year=2025/26
+ *
+ * Assignment user dropdown:
+ * We DO NOT filter users by users.financial_year anymore.
+ * The FY is only kept in the response for display/context.
+ *
+ * Reason:
+ * Financial year belongs to projects/ARWP, not to the user's eligibility.
+ */
+router.get("/users-by-financial-year", async (req, res) => {
+  try {
+    console.log("HIT GET /api/utilities/users-by-financial-year", req.query);
+
+    const fyRaw = req.query.financial_year;
+    const selectedFYKey = extractFYKey(fyRaw);
+    const selectedFYEnd = extractFYEnd(fyRaw);
+    const storedFY = selectedFYKey ? toStoredFinancialYear(selectedFYKey) : null;
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.full_name,
+        u.role,
+        u.region,
+        u.email,
+        u.phone,
+
+        u.financial_year AS primary_financial_year,
+        u.financial_year,
+
+        ? AS assignment_financial_year,
+        ? AS fy_end
+
+      FROM users u
+      ORDER BY
+        u.role,
+        u.region,
+        u.full_name,
+        u.username
+      `,
+      [storedFY, selectedFYEnd]
+    );
+
+    return res.json({
+      success: true,
+      financial_year: storedFY,
+      financial_year_end: selectedFYEnd,
+      users: rows || [],
+    });
+  } catch (err) {
+    console.error("Error loading assignment users:", err);
+
+    return res.status(500).json({
+      message: "Failed to load users for assignment",
+      error: err.message,
+      code: err.code || null,
+      sqlMessage: err.sqlMessage || null,
+    });
+  }
+});
+
+/**
  * GET /api/utilities/assignment-projects?user_id=123&financial_year=2025/26
  *
- * Option A strict ARWP-linked projects:
- * Returns only projects already linked through annual_workplan_project_lots.
+ * Returns ARWP-linked projects for the selected FY.
  *
- * Financial year rule:
- * We compare by FY ending, e.g. 26, not exact text.
+ * Region rule:
+ * - RE can see projects across regions.
+ * - Other roles only see projects matching their user region.
+ *
+ * Already-assigned projects are excluded for that same user.
  */
 router.get("/assignment-projects", async (req, res) => {
   try {
@@ -122,7 +190,7 @@ router.get("/assignment-projects", async (req, res) => {
 
     const [userRows] = await db.query(
       `
-      SELECT 
+      SELECT
         id,
         username,
         full_name,
@@ -141,20 +209,12 @@ router.get("/assignment-projects", async (req, res) => {
     }
 
     const selectedUser = userRows[0];
+    const selectedUserRole = normalizeRole(selectedUser.role);
+    const isRE = selectedUserRole === "re";
 
-    if (!selectedUser.region) {
+    if (!isRE && !selectedUser.region) {
       return res.status(400).json({
         message: "Selected user has no region set in the users table",
-      });
-    }
-
-    const userFYEnd = extractFYEnd(selectedUser.financial_year);
-
-    if (userFYEnd !== selectedFYEnd) {
-      return res.status(409).json({
-        message: `Selected user belongs to FY ending ${userFYEnd || "unknown"}, not FY ending ${selectedFYEnd}`,
-        userFinancialYear: selectedUser.financial_year,
-        selectedFinancialYear: storedFY,
       });
     }
 
@@ -174,7 +234,7 @@ router.get("/assignment-projects", async (req, res) => {
         awpl.lot_no,
         awpl.category
 
-            FROM annual_workplans aw
+      FROM annual_workplans aw
       INNER JOIN annual_workplan_project_lots awpl
         ON awpl.workplan_id = aw.id
       INNER JOIN projects p
@@ -183,35 +243,22 @@ router.get("/assignment-projects", async (req, res) => {
         ON up.project_id = p.id
         AND up.user_id = ?
 
-      WHERE LOWER(TRIM(aw.region)) = LOWER(TRIM(?))
-        AND up.project_id IS NULL
+      WHERE up.project_id IS NULL
+        AND (
+          ? = 1
+          OR LOWER(TRIM(COALESCE(NULLIF(p.region, ''), aw.region))) = LOWER(TRIM(?))
+        )
 
       ORDER BY
         p.project_number ASC,
         p.project_name ASC
       `,
-      [userId, selectedUser.region]
+      [userId, isRE ? 1 : 0, selectedUser.region || ""]
     );
 
     const filteredProjects = (rows || []).filter((project) => {
       const arwpFYEnd = extractFYEnd(project.workplan_financial_year);
       return arwpFYEnd === selectedFYEnd;
-    });
-
-    console.log("ASSIGNMENT PROJECTS DEBUG:", {
-      selectedUser: selectedUser.username,
-      selectedRegion: selectedUser.region,
-      selectedFYEnd,
-      rawCount: rows.length,
-      filteredCount: filteredProjects.length,
-      rawProjects: rows.map((p) => ({
-        id: p.id,
-        project_number: p.project_number,
-        project_name: p.project_name,
-        project_fy: p.financial_year,
-        arwp_fy: p.workplan_financial_year,
-        arwp_region: p.workplan_region,
-      })),
     });
 
     return res.json({
@@ -226,19 +273,29 @@ router.get("/assignment-projects", async (req, res) => {
       },
       financial_year: storedFY,
       financial_year_end: selectedFYEnd,
-      region: selectedUser.region,
+      region_rule_applied: isRE ? "RE can see all regions" : selectedUser.region,
       projects: filteredProjects,
     });
   } catch (err) {
     console.error("Error loading assignment projects:", err);
+
     return res.status(500).json({
       message: "Failed to load ARWP-linked projects for assignment",
+      error: err.message,
+      code: err.code || null,
+      sqlMessage: err.sqlMessage || null,
     });
   }
 });
 
 /**
  * POST /api/utilities/assign-user-project
+ *
+ * Assignment rule:
+ * - Do not enforce users.financial_year.
+ * - Do not update users.financial_year.
+ * - Non-RE users must match the project region.
+ * - RE can be assigned across regions.
  */
 router.post("/assign-user-project", async (req, res) => {
   try {
@@ -247,7 +304,6 @@ router.post("/assign-user-project", async (req, res) => {
     const userId = Number(req.body.user_id);
     const projectId = Number(req.body.project_id);
     const makePrimary = parseBoolean(req.body.make_primary);
-    const confirmMismatch = parseBoolean(req.body.confirm_mismatch);
 
     if (!Number.isInteger(userId) || !Number.isInteger(projectId)) {
       return res
@@ -256,7 +312,18 @@ router.post("/assign-user-project", async (req, res) => {
     }
 
     const [userRows] = await db.query(
-      "SELECT id, username, full_name, role, financial_year FROM users WHERE id = ? LIMIT 1",
+      `
+      SELECT
+        id,
+        username,
+        full_name,
+        role,
+        region,
+        financial_year
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
       [userId]
     );
 
@@ -265,11 +332,31 @@ router.post("/assign-user-project", async (req, res) => {
     }
 
     const user = userRows[0];
-    const userFYKey = extractFYKey(user.financial_year);
-    const userFYEnd = extractFYEnd(user.financial_year);
+
+    const normalizedUserRole = normalizeRole(user.role);
+
+      if (
+        normalizedUserRole === "admin" ||
+        normalizedUserRole === "systemadmin" ||
+        normalizedUserRole === "systemadministrator"
+      ) {
+        return res.status(403).json({
+          message: "Admin users cannot be assigned to projects.",
+        });
+      }
 
     const [projectRows] = await db.query(
-      "SELECT id, project_number, project_name, financial_year FROM projects WHERE id = ? LIMIT 1",
+      `
+      SELECT
+        id,
+        project_number,
+        project_name,
+        region,
+        financial_year
+      FROM projects
+      WHERE id = ?
+      LIMIT 1
+      `,
       [projectId]
     );
 
@@ -278,32 +365,42 @@ router.post("/assign-user-project", async (req, res) => {
     }
 
     const project = projectRows[0];
+
+    const userRole = normalizeRole(user.role);
+    const isRE = userRole === "re";
+
+    const userRegion = String(user.region || "").trim().toLowerCase();
+    const projectRegion = String(project.region || "").trim().toLowerCase();
+
+    if (!isRE) {
+      if (!userRegion) {
+        return res.status(400).json({
+          message: "Selected user has no region set. Non-RE users must have a region.",
+        });
+      }
+
+      if (!projectRegion) {
+        return res.status(400).json({
+          message: "Selected project has no region set. Cannot enforce regional rule.",
+        });
+      }
+
+      if (userRegion !== projectRegion) {
+        return res.status(409).json({
+          message: `Region mismatch: ${user.full_name || user.username} is in ${user.region}, but the project is in ${project.region}. Only RE can be assigned across regions.`,
+          userRegion: user.region,
+          projectRegion: project.region,
+        });
+      }
+    }
+
     const projectFYKey =
       extractFYKey(project.project_number) ||
       extractFYKey(project.financial_year);
 
-    if (!projectFYKey) {
-      return res.status(400).json({
-        message:
-          "Project FY is missing/invalid. Ensure project_number or financial_year contains FY2025/26 or 2025-2026 etc.",
-      });
-    }
-
-    const storedProjectFY = toStoredFinancialYear(projectFYKey);
-    const projectFYEnd =
-      extractFYEnd(project.project_number) || extractFYEnd(project.financial_year);
-
-    const mismatch = !!userFYEnd && userFYEnd !== projectFYEnd;
-
-    if (mismatch && !confirmMismatch) {
-      return res.status(409).json({
-        require_confirmation: true,
-        message: `FY mismatch: user is ${userFYKey || "unset"} but project is ${projectFYKey}. Click OK to assign anyway and update the user to ${storedProjectFY}.`,
-        userFY: userFYKey,
-        projectFY: projectFYKey,
-        newUserFinancialYear: storedProjectFY,
-      });
-    }
+    const storedProjectFY = projectFYKey
+      ? toStoredFinancialYear(projectFYKey)
+      : project.financial_year || null;
 
     if (makePrimary) {
       await db.query(
@@ -316,55 +413,67 @@ router.post("/assign-user-project", async (req, res) => {
       `
       INSERT INTO user_projects (user_id, project_id, is_primary)
       VALUES (?, ?, ?)
-      ON DUPLICATE KEY UPDATE is_primary = VALUES(is_primary)
+      ON DUPLICATE KEY UPDATE
+        is_primary = VALUES(is_primary)
       `,
       [userId, projectId, makePrimary ? 1 : 0]
     );
+
     const workflowColumn = workflowColumnForRole(user.role);
 
-if (workflowColumn) {
-  const [workflowRows] = await db.query(
-    "SELECT project_id FROM project_workflow_assignments WHERE project_id = ? LIMIT 1",
-    [projectId]
-  );
-
-  if (workflowRows.length > 0) {
-    await db.query(
-      `UPDATE project_workflow_assignments
-       SET ${workflowColumn} = ?
-       WHERE project_id = ?`,
-      [userId, projectId]
-    );
-  } else {
-    await db.query(
-      `INSERT INTO project_workflow_assignments
-       (project_id, ${workflowColumn})
-       VALUES (?, ?)`,
-      [projectId, userId]
-    );
-  }
-}
-
-    if (storedProjectFY && user.financial_year !== storedProjectFY) {
-      await db.query(
-        "UPDATE users SET financial_year = ? WHERE id = ?",
-        [storedProjectFY, userId]
+    if (workflowColumn) {
+      const [workflowRows] = await db.query(
+        "SELECT project_id FROM project_workflow_assignments WHERE project_id = ? LIMIT 1",
+        [projectId]
       );
+
+      if (workflowRows.length > 0) {
+        await db.query(
+          `UPDATE project_workflow_assignments
+           SET ${workflowColumn} = ?
+           WHERE project_id = ?`,
+          [userId, projectId]
+        );
+      } else {
+        await db.query(
+          `INSERT INTO project_workflow_assignments
+           (project_id, ${workflowColumn})
+           VALUES (?, ?)`,
+          [projectId, userId]
+        );
+      }
     }
 
     return res.json({
       success: true,
-      message: mismatch
-        ? "Project assigned. User financial year updated to match the project."
-        : "Project assigned to user.",
-      userFYBefore: userFYKey,
-      projectFY: projectFYKey,
-      userFinancialYear: storedProjectFY,
-      mismatchOverridden: mismatch,
+      message: "Project assigned to user.",
+      user: {
+        id: user.id,
+        username: user.username,
+        full_name: user.full_name,
+        role: user.role,
+        region: user.region,
+        primary_financial_year: user.financial_year,
+      },
+      project: {
+        id: project.id,
+        project_number: project.project_number,
+        project_name: project.project_name,
+        region: project.region,
+        financial_year: project.financial_year,
+        normalized_financial_year: storedProjectFY,
+      },
+      regionRule: isRE ? "RE cross-region assignment allowed" : "Region matched",
     });
   } catch (err) {
     console.error("Error assigning project to user:", err);
-    return res.status(500).json({ message: "Failed to assign project to user" });
+
+    return res.status(500).json({
+      message: "Failed to assign project to user",
+      error: err.message,
+      code: err.code || null,
+      sqlMessage: err.sqlMessage || null,
+    });
   }
 });
 
@@ -402,7 +511,95 @@ router.get("/user-projects/:userId", async (req, res) => {
     return res.status(500).json({ message: "Failed to load user projects" });
   }
 });
+/**
+ * POST /api/utilities/unassign-user-projects
+ *
+ * Removes one or more projects from a user.
+ * Also clears the matching workflow role column if that same user is assigned there.
+ */
+router.post("/unassign-user-projects", async (req, res) => {
+  try {
+    console.log("HIT POST /api/utilities/unassign-user-projects", req.body);
 
+    const userId = Number(req.body.user_id);
+    const projectIds = uniquePositiveIntegers(req.body.project_ids);
+
+    if (!Number.isInteger(userId) || projectIds.length === 0) {
+      return res.status(400).json({
+        message: "Valid user_id and non-empty project_ids[] are required",
+      });
+    }
+
+    const [userRows] = await db.query(
+      `
+      SELECT id, username, full_name, role
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (!userRows || userRows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const user = userRows[0];
+    const workflowColumn = workflowColumnForRole(user.role);
+
+    const placeholders = projectIds.map(() => "?").join(", ");
+
+    // 1. Remove from user_projects
+    const [deletedUserProjects] = await db.query(
+      `
+      DELETE FROM user_projects
+      WHERE user_id = ?
+        AND project_id IN (${placeholders})
+      `,
+      [userId, ...projectIds]
+    );
+
+    let workflowRowsCleared = 0;
+
+    // 2. Clear workflow assignment for this user's role only
+    if (workflowColumn) {
+      const [workflowResult] = await db.query(
+        `
+        UPDATE project_workflow_assignments
+        SET ${workflowColumn} = NULL
+        WHERE project_id IN (${placeholders})
+          AND ${workflowColumn} = ?
+        `,
+        [...projectIds, userId]
+      );
+
+      workflowRowsCleared = workflowResult.affectedRows || 0;
+    }
+
+    return res.json({
+      success: true,
+      message: "Selected project assignment(s) removed.",
+      user: {
+        id: user.id,
+        username: user.username,
+        full_name: user.full_name,
+        role: user.role,
+      },
+      project_ids: projectIds,
+      deleted_user_project_rows: deletedUserProjects.affectedRows || 0,
+      workflow_rows_cleared: workflowRowsCleared,
+    });
+  } catch (err) {
+    console.error("Error unassigning user projects:", err);
+
+    return res.status(500).json({
+      message: "Failed to unassign selected projects",
+      error: err.message,
+      code: err.code || null,
+      sqlMessage: err.sqlMessage || null,
+    });
+  }
+});
 /**
  * GET /api/utilities/project-roads/:projectId
  */
@@ -600,35 +797,68 @@ router.post("/road-activities/:roadId", (req, res) => {
 
 /**
  * POST /api/utilities/set-user-financial-year
+ *
+ * Keeps users.financial_year for Manage Users,
+ * but also activates the user in user_financial_years for assignment filtering.
  */
-router.post("/set-user-financial-year", (req, res) => {
-  const userId = Number(req.body.user_id);
-  const fyRaw = req.body.financial_year;
+router.post("/set-user-financial-year", async (req, res) => {
+  try {
+    const userId = Number(req.body.user_id);
+    const fyRaw = req.body.financial_year;
 
-  if (!Number.isInteger(userId)) {
-    return res.status(400).json({ message: "Valid user_id is required" });
-  }
-
-  const fyKey = extractFYKey(fyRaw);
-  if (!fyKey) {
-    return res.status(400).json({
-      message: "Invalid financial_year. Use something like 2027/28 or FY2027/28.",
-    });
-  }
-
-  const storedFY = toStoredFinancialYear(fyKey);
-
-  db.query("UPDATE users SET financial_year = ? WHERE id = ?", [storedFY, userId], (err) => {
-    if (err) {
-      console.error("Error updating user financial_year:", err);
-      return res.status(500).json({ message: "Failed to update user FY" });
+    if (!Number.isInteger(userId)) {
+      return res.status(400).json({ message: "Valid user_id is required" });
     }
+
+    const fyKey = extractFYKey(fyRaw);
+    const fyEnd = extractFYEnd(fyRaw);
+
+    if (!fyKey || !fyEnd) {
+      return res.status(400).json({
+        message: "Invalid financial_year. Use something like 2027/28 or FY2027/28.",
+      });
+    }
+
+    const storedFY = toStoredFinancialYear(fyKey);
+
+    await db.query(
+      "UPDATE users SET financial_year = ? WHERE id = ?",
+      [storedFY, userId]
+    );
+
+    await db.query(
+      `
+      INSERT INTO user_financial_years (
+        user_id,
+        financial_year,
+        fy_end,
+        is_active
+      )
+      VALUES (?, ?, ?, 1)
+      ON DUPLICATE KEY UPDATE
+        fy_end = VALUES(fy_end),
+        is_active = 1,
+        updated_at = CURRENT_TIMESTAMP
+      `,
+      [userId, storedFY, fyEnd]
+    );
+
     return res.json({
       success: true,
       message: `User financial year set to ${storedFY}`,
       financial_year: storedFY,
+      fy_end: fyEnd,
     });
-  });
+  } catch (err) {
+    console.error("Error updating user financial year:", err);
+
+    return res.status(500).json({
+      message: "Failed to update user FY",
+      error: err.message,
+      code: err.code || null,
+      sqlMessage: err.sqlMessage || null,
+    });
+  }
 });
 
 // ✅ GET /api/utilities/activities
