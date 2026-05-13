@@ -2102,5 +2102,195 @@ router.get("/active/by-region", async (req, res) => {
     });
   }
 });
+function getARWPSheetName(financialYear) {
+  const text = String(financialYear || "").trim();
+  const match = text.match(/^(\d{4})\/(\d{2})$/);
 
+  if (match) {
+    return `ARWP FY ${match[1]}-20${match[2]}`;
+  }
+
+  return "ARWP_LINES";
+}
+/**
+ * GET /api/annual-workplans/templates/arwp-import-template
+ *
+ * Downloads a blank Barabara-standard ARWP Excel template.
+ * Regions should fill this template so ARWP imports remain consistent.
+ */
+router.get("/templates/arwp-import-template", async (req, res) => {
+  try {
+    const financialYear = normalizeFinancialYear(
+      req.query.financial_year || "2025/26"
+    );
+
+    const region = String(req.query.region || "Coast").trim();
+    const arwpSheetName = getARWPSheetName(financialYear);
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "Barabara";
+    workbook.created = new Date();
+
+    // =========================
+    // 1. README sheet
+    // =========================
+    const readme = workbook.addWorksheet("README");
+
+    readme.columns = [
+      { header: "Item", key: "item", width: 28 },
+      { header: "Instruction", key: "instruction", width: 100 },
+    ];
+
+    readme.addRows([
+      {
+        item: "Purpose",
+        instruction:
+          "This template captures ARWP activity lines and package/lot information in the standard Barabara format.",
+      },
+      {
+        item: "Financial Year",
+        instruction: financialYear,
+      },
+      {
+        item: "Region",
+        instruction: region,
+      },
+      {
+        item: "ARWP Sheet",
+        instruction: `Fill the sheet named '${arwpSheetName}'. Do not rename it unless you also pass the sheet name during import.`,
+      },
+      {
+        item: "PACKAGES Sheet",
+        instruction:
+          "Fill one row per road/package relationship. Every road in the ARWP sheet should appear in PACKAGES with its lot number and category.",
+      },
+      {
+        item: "Category",
+        instruction:
+          "Use ROUTINE MAINTENANCE or PERIODIC MAINTENANCE for consistency.",
+      },
+      {
+        item: "Rates",
+        instruction:
+          "If Rate With VAT is provided, Barabara uses it. If it is blank, Barabara uses Rate Without VAT.",
+      },
+      {
+        item: "Amount Check",
+        instruction:
+          "Amount Check is for Excel checking only. Barabara calculates planned_amount from quantity × selected rate.",
+      },
+      {
+        item: "Chainage",
+        instruction:
+          "Chainage may be entered as decimal kilometres such as 1.25 or in road format such as 1+250.",
+      },
+    ]);
+
+    readme.getRow(1).font = { bold: true };
+    readme.views = [{ state: "frozen", ySplit: 1 }];
+
+    // =========================
+    // 2. ARWP activity lines sheet
+    // These column positions match the existing importer.
+    // =========================
+    const arwp = workbook.addWorksheet(arwpSheetName);
+
+    arwp.columns = [
+      { header: "Road Code", key: "road_code", width: 18 }, // col 1
+      { header: "Road Name", key: "road_name", width: 35 }, // col 2
+      { header: "Surface Type", key: "surface_type", width: 16 }, // col 3
+      { header: "Condition", key: "condition", width: 16 }, // col 4
+      { header: "Road Length Km", key: "road_length_km", width: 16 }, // col 5
+      { header: "Activity Code", key: "activity_code", width: 18 }, // col 6
+      { header: "Activity Name", key: "activity_name", width: 45 }, // col 7
+      { header: "Method", key: "method", width: 18 }, // col 8
+      { header: "Unit", key: "unit", width: 12 }, // col 9
+      { header: "Planned Quantity", key: "planned_quantity", width: 18 }, // col 10
+      { header: "Chainage Start", key: "chainage_start", width: 18 }, // col 11
+      { header: "Chainage End", key: "chainage_end", width: 18 }, // col 12
+      { header: "Amount Check", key: "amount_check", width: 18 }, // col 13
+      { header: "Rate Without VAT", key: "rate_without_vat", width: 18 }, // col 14
+      { header: "Rate With VAT", key: "rate_with_vat", width: 18 }, // col 15
+      { header: "Remarks", key: "remarks", width: 35 }, // col 16
+    ];
+
+    arwp.getRow(1).font = { bold: true };
+    arwp.views = [{ state: "frozen", ySplit: 1 }];
+
+    for (let rowNumber = 2; rowNumber <= 1001; rowNumber++) {
+      arwp.getCell(`M${rowNumber}`).value = {
+        formula: `J${rowNumber}*IF(O${rowNumber}<>"",O${rowNumber},N${rowNumber})`,
+      };
+    }
+
+    // =========================
+    // 3. PACKAGES sheet
+    // These first 9 columns match the existing packageMap importer.
+    // Extra columns are for region/admin reference.
+    // =========================
+    const packages = workbook.addWorksheet("PACKAGES");
+
+    packages.columns = [
+      { header: "Town", key: "town", width: 22 }, // col 1
+      { header: "Road Code", key: "road_code", width: 18 }, // col 2
+      { header: "Road Name", key: "road_name", width: 35 }, // col 3
+      { header: "Surface Type", key: "surface_type", width: 16 }, // col 4
+      { header: "Condition Status", key: "condition_status", width: 18 }, // col 5
+      { header: "Road Length Km", key: "road_length_km", width: 16 }, // col 6
+      { header: "Budget", key: "budget", width: 18 }, // col 7
+      { header: "Lot No", key: "lot_no", width: 12 }, // col 8
+      { header: "Category", key: "category", width: 24 }, // col 9
+      { header: "Contract Number", key: "contract_number", width: 32 },
+      { header: "Package Description", key: "package_description", width: 45 },
+    ];
+
+    packages.getRow(1).font = { bold: true };
+    packages.views = [{ state: "frozen", ySplit: 1 }];
+
+    for (let rowNumber = 2; rowNumber <= 1001; rowNumber++) {
+      packages.getCell(`I${rowNumber}`).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: ['"ROUTINE MAINTENANCE,PERIODIC MAINTENANCE"'],
+      };
+    }
+
+    // Style headers
+    [readme, arwp, packages].forEach((sheet) => {
+      sheet.getRow(1).eachCell((cell) => {
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFE6E6E6" },
+        };
+        cell.border = {
+          bottom: { style: "thin", color: { argb: "FF999999" } },
+        };
+      });
+    });
+
+    const safeRegion = region.replace(/[^a-z0-9]+/gi, "_");
+    const safeFY = financialYear.replace(/[^a-z0-9]+/gi, "_");
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeRegion}_ARWP_Import_Template_${safeFY}.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("Error generating ARWP template:", error);
+
+    res.status(500).json({
+      message: "Failed to generate ARWP template",
+      error: error.message,
+    });
+  }
+});
 module.exports = router;
