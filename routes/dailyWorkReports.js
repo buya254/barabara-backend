@@ -391,15 +391,96 @@ router.get("/:id", authenticateJWT, async (req, res) => {
     if (!report) return res.status(404).json({ message: "Report not found" });
 
     const assignment = await getAssignment(report.project_id);
-    const isAdmin = String(req.user.role).toLowerCase() === "admin";
-    const allowed = isAdmin || isAssignedToProject(req.user, assignment);
-    if (!allowed) return res.status(403).json({ message: "Forbidden" });
+
+    const userRole = String(req.user.role || "").toLowerCase();
+    const uid = String(req.user.id);
+
+    const isAdminUser = userRole === "admin";
+    const isWorkflowAssigned = isAssignedToProject(req.user, assignment);
+    const isCreator = String(report.created_by || "") === uid;
+
+    // Extra safety: if the user is assigned to the project in user_projects,
+    // allow them to read the report even if workflow table has an old/missing value.
+    const [userProjectRows] = await db.query(
+      `
+      SELECT 1
+      FROM user_projects
+      WHERE user_id = ?
+        AND project_id = ?
+      LIMIT 1
+      `,
+      [req.user.id, report.project_id]
+    );
+
+    const isInUserProjects = userProjectRows.length > 0;
+
+    const allowed =
+      isAdminUser || isWorkflowAssigned || isCreator || isInUserProjects;
+
+    if (!allowed) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
     const withParsed = await getReportWithParsed(report.id);
     const lastAction = await getLastAction(report.id);
 
+    const [projectRows] = await db.query(
+      `
+      SELECT
+        p.id,
+        p.project_number,
+        p.project_name,
+        p.name,
+        p.region,
+        p.financial_year,
+        p.contractor,
+        p.chainage,
+        p.project_duration,
+
+        c.id AS contract_id,
+        c.contract_name,
+        c.financial_year AS contract_financial_year
+      FROM projects p
+      LEFT JOIN contracts c
+        ON c.project_id = p.id
+      WHERE p.id = ?
+      ORDER BY c.id DESC
+      LIMIT 1
+      `,
+      [report.project_id]
+    );
+
+    const project = projectRows[0] || null;
+
     return res.json({
       ...withParsed,
+
+      // Give frontend an object, not only the raw JSON string.
+      form_json: withParsed.form_json_parsed || {},
+
+      project: project
+        ? {
+            id: project.id,
+            project_number: project.project_number,
+            project_name: project.project_name,
+            name: project.name,
+            region: project.region,
+            financial_year: project.financial_year,
+            contractor: project.contractor,
+            chainage: project.chainage,
+            project_duration: project.project_duration,
+          }
+        : null,
+
+      contract: project
+        ? {
+            id: project.contract_id || report.contract_id || null,
+            contract_name: project.contract_name || project.project_number,
+            financial_year:
+              project.contract_financial_year || project.financial_year,
+          }
+        : null,
+
       tracking: {
         ...statusTracker(report),
         lastActionAt: lastAction?.created_at || null,

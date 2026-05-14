@@ -11,13 +11,19 @@ const excludedUsernames = ["phabade", "bmagenyi"];
 // One place to define default password (or override via .env)
 const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "Kura1234";
 
-/** GET all users with optional filters */
+/** GET all users with optional filters, including read-only assigned projects */
+/** GET all users with optional filters, including read-only assigned projects */
 router.get("/users", async (req, res) => {
   try {
     const { username, fy, phone, region } = req.query;
 
-    let query = "SELECT * FROM users WHERE 1=1";
-    const values = [];
+    let query = `
+      SELECT *
+      FROM users
+      WHERE username NOT IN (?, ?)
+    `;
+
+    const values = [...excludedUsernames];
 
     if (username) {
       query += " AND username LIKE ?";
@@ -33,22 +39,89 @@ router.get("/users", async (req, res) => {
       query += " AND phone LIKE ?";
       values.push(`%${phone}%`);
     }
+
     if (region) {
       query += " AND region LIKE ?";
       values.push(`%${region}%`);
     }
 
+    query += " ORDER BY role, region, full_name, username";
+
     const [users] = await db.query(query, values);
 
-    const filtered = users.filter((u) => !excludedUsernames.includes(u.username));
+    if (!users || users.length === 0) {
+      return res.json([]);
+    }
 
-    res.json(filtered);
+    const userIds = users.map((u) => u.id);
+    const placeholders = userIds.map(() => "?").join(", ");
+
+    const [projectRows] = await db.query(
+      `
+      SELECT
+        up.user_id,
+        up.project_id,
+        up.is_primary,
+        p.project_number,
+        p.project_name,
+        p.region,
+        p.financial_year
+      FROM user_projects up
+      INNER JOIN projects p
+        ON p.id = up.project_id
+      WHERE up.user_id IN (${placeholders})
+      ORDER BY
+        up.user_id,
+        up.is_primary DESC,
+        p.project_number ASC,
+        p.project_name ASC
+      `,
+      userIds
+    );
+
+    const projectMap = new Map();
+
+    for (const row of projectRows || []) {
+      const key = String(row.user_id);
+
+      if (!projectMap.has(key)) {
+        projectMap.set(key, []);
+      }
+
+      projectMap.get(key).push({
+        project_id: row.project_id,
+        is_primary: row.is_primary,
+        project_number: row.project_number,
+        project_name: row.project_name,
+        region: row.region,
+        financial_year: row.financial_year,
+      });
+    }
+
+    const enrichedUsers = users.map((user) => {
+      const assignedProjects = projectMap.get(String(user.id)) || [];
+
+      const primaryProject =
+        assignedProjects.find((p) => Number(p.is_primary) === 1) ||
+        assignedProjects[0] ||
+        null;
+
+      return {
+        ...user,
+        assigned_projects: assignedProjects,
+
+        // These are the visible first/default values.
+        project_number: primaryProject?.project_number || "",
+        project_name: primaryProject?.project_name || "",
+      };
+    });
+
+    return res.json(enrichedUsers);
   } catch (err) {
     console.error("Failed to fetch users:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
-
 /** GET paginated users */
 router.get("/users-paged", async (req, res) => {
   const page = parseInt(req.query.page) || 1;
