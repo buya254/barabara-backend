@@ -175,6 +175,18 @@ async function getLastAction(reportId) {
   return rows[0] || null;
 }
 
+async function getNextUserReportNo(userId) {
+  const [rows] = await db.query(
+    `
+    SELECT COALESCE(MAX(user_report_no), 0) + 1 AS next_no
+    FROM daily_work_reports
+    WHERE created_by = ?
+    `,
+    [String(userId)]
+  );
+
+  return Number(rows?.[0]?.next_no || 1);
+}
 // ---------------- ROUTES ----------------
 
 /**
@@ -399,8 +411,6 @@ router.get("/:id", authenticateJWT, async (req, res) => {
     const isWorkflowAssigned = isAssignedToProject(req.user, assignment);
     const isCreator = String(report.created_by || "") === uid;
 
-    // Extra safety: if the user is assigned to the project in user_projects,
-    // allow them to read the report even if workflow table has an old/missing value.
     const [userProjectRows] = await db.query(
       `
       SELECT 1
@@ -455,8 +465,8 @@ router.get("/:id", authenticateJWT, async (req, res) => {
     return res.json({
       ...withParsed,
 
-      // Give frontend an object, not only the raw JSON string.
       form_json: withParsed.form_json_parsed || {},
+      user_report_no: report.user_report_no,
 
       project: project
         ? {
@@ -541,21 +551,32 @@ router.post("/", authenticateJWT, async (req, res) => {
       });
     }
 
-    const insertSql = `
-      INSERT INTO daily_work_reports
-        (project_id, contract_id, report_date, status, form_json, created_by)
-      VALUES (?, ?, ?, 'DRAFT', ?, ?)
-    `;
+    const nextUserReportNo = await getNextUserReportNo(req.user.id);
 
-    const [result] = await db.query(insertSql, [
-      resolvedProjectId,
-      contract_id || null,
-      report_date,
-      jsonStr,
-      String(req.user.id),
-    ]);
+      const insertSql = `
+        INSERT INTO daily_work_reports
+          (
+            user_report_no,
+            project_id,
+            contract_id,
+            report_date,
+            status,
+            form_json,
+            created_by
+          )
+        VALUES (?, ?, ?, ?, 'DRAFT', ?, ?)
+      `;
 
-    // ✅ action log
+      const [result] = await db.query(insertSql, [
+        nextUserReportNo,
+        resolvedProjectId,
+        contract_id || null,
+        report_date,
+        jsonStr,
+        String(req.user.id),
+      ]);
+    
+      // ✅ action log
     await logDwrAction({
       reportId: result.insertId,
       actionType: "CREATED",
