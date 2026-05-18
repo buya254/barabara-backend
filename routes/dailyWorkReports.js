@@ -55,7 +55,37 @@ async function getReportWithParsed(id) {
     return { ...r, form_json_parsed: null };
   }
 }
+  function toDateOnlyString(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
 
+    return `${year}-${month}-${day}`;
+  }
+
+  function getReportDateValidationError(reportDate) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(reportDate || ""))) {
+      return "report_date must be in YYYY-MM-DD format";
+    }
+
+    const today = toDateOnlyString(new Date());
+
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrow = toDateOnlyString(tomorrowDate);
+
+    if (reportDate < today) {
+      return "You cannot create a daily report for a past date.";
+    }
+
+    if (reportDate > tomorrow) {
+      return "You can only create a daily report for today or tomorrow.";
+    }
+
+    return null;
+  }
+
+ 
 /**
  * Resolve project_id.
  * Accepts:
@@ -521,6 +551,11 @@ router.post("/", authenticateJWT, async (req, res) => {
 
     if (!report_date) {
       return res.status(400).json({ message: "report_date is required" });
+    }
+    const reportDateError = getReportDateValidationError(report_date);
+
+    if (reportDateError) {
+      return res.status(400).json({ message: reportDateError });
     }
 
     const resolvedProjectId = await resolveProjectId({ project_id, project_number });
