@@ -21,6 +21,7 @@ const utilitiesRoutes = require("./routes/utilitiesRoute");
 const roadsRouter = require("./routes/roads");
 const importRoadsRoutes = require("./routes/importRoadsRoutes");
 const annualWorkplanRoutes = require("./routes/annualWorkplans");
+const weatherRoute = require("./routes/weatherRoute");
 
 
 
@@ -70,6 +71,7 @@ app.use("/api/utilities", utilitiesRoutes);
 app.use("/api/roads", roadsRouter);
 app.use("/api/import-roads", importRoadsRoutes);
 app.use("/api/annual-workplans", annualWorkplanRoutes);
+app.use("/api/weather", weatherRoute);
 
 
 
