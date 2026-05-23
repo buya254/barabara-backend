@@ -1,0 +1,480 @@
+const express = require("express");
+const router = express.Router();
+const db = require("../db");
+const authenticateJWT = require("../middlewares/auth");
+
+function normalizeRole(role) {
+  return String(role || "")
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/_/g, "")
+    .replace(/\s+/g, "");
+}
+
+function makeTempInstructionNumber() {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:T.Z]/g, "")
+    .slice(0, 14);
+
+  return `BBR-SI-${stamp}`;
+}
+
+async function userHasProjectAccess(userId, projectId) {
+  const [rows] = await db.query(
+    `
+    SELECT 1
+    FROM user_projects
+    WHERE user_id = ?
+      AND project_id = ?
+    LIMIT 1
+    `,
+    [userId, projectId]
+  );
+
+  return rows.length > 0;
+}
+
+async function getWorkflowAssignment(projectId) {
+  const [rows] = await db.query(
+    `
+    SELECT *
+    FROM project_workflow_assignments
+    WHERE project_id = ?
+    LIMIT 1
+    `,
+    [projectId]
+  );
+
+  return rows[0] || null;
+}
+
+function isWorkflowUser(user, assignment) {
+  if (!assignment) return false;
+
+  const uid = String(user?.id || "");
+
+  return (
+    String(assignment.siteagent_id || "") === uid ||
+    String(assignment.inspector_id || "") === uid ||
+    String(assignment.are_id || "") === uid ||
+    String(assignment.re_id || "") === uid
+  );
+}
+
+async function canViewProjectInstructions(user, projectId) {
+  const role = normalizeRole(user?.role);
+
+  if (role === "admin") return true;
+
+  const hasAccess = await userHasProjectAccess(user.id, projectId);
+  if (hasAccess) return true;
+
+  const assignment = await getWorkflowAssignment(projectId);
+  return isWorkflowUser(user, assignment);
+}
+
+async function canCreateProjectInstruction(user, projectId) {
+  const role = normalizeRole(user?.role);
+
+  if (role === "admin") return true;
+  if (role !== "re") return false;
+
+  const hasAccess = await userHasProjectAccess(user.id, projectId);
+  if (hasAccess) return true;
+
+  const assignment = await getWorkflowAssignment(projectId);
+  return String(assignment?.re_id || "") === String(user.id);
+}
+
+async function getProject(projectId) {
+  const [rows] = await db.query(
+    `
+    SELECT
+      id,
+      project_number,
+      project_name,
+      name,
+      region,
+      contractor,
+      financial_year
+    FROM projects
+    WHERE id = ?
+    LIMIT 1
+    `,
+    [projectId]
+  );
+
+  return rows[0] || null;
+}
+
+// GET /api/work-instructions/project/:projectId
+router.get("/project/:projectId", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = Number(req.params.projectId);
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Invalid project id." });
+    }
+
+    const allowed = await canViewProjectInstructions(req.user, projectId);
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view site instructions for this project.",
+      });
+    }
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        wi.*,
+        p.project_number,
+        p.project_name,
+        p.name AS project_name_alt,
+        p.contractor AS project_contractor,
+        p.region AS project_region,
+        issued.username AS issued_by_username,
+        issued.full_name AS issued_by_name,
+        issued_to.username AS issued_to_username,
+        issued_to.full_name AS issued_to_name
+      FROM work_instructions wi
+      LEFT JOIN projects p
+        ON p.id = wi.project_id
+      LEFT JOIN users issued
+        ON issued.id = wi.issued_by
+      LEFT JOIN users issued_to
+        ON issued_to.id = wi.issued_to_user_id
+      WHERE wi.project_id = ?
+      ORDER BY
+        wi.instruction_date DESC,
+        wi.instruction_number DESC,
+        wi.id ASC
+      `,
+      [projectId]
+    );
+
+    return res.json({
+      success: true,
+      instructions: rows,
+    });
+  } catch (err) {
+    console.error("Work instructions list error:", err);
+    return res.status(500).json({ message: "Failed to load site instructions." });
+  }
+});
+// GET /api/work-instructions/project/:projectId/arwp-lines
+// R.E uses this to pick ARWP activity placeholders when creating a Site Instruction.
+router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = Number(req.params.projectId);
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Invalid project id." });
+    }
+
+    const allowed = await canViewProjectInstructions(req.user, projectId);
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view ARWP lines for this project.",
+      });
+    }
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        p.id AS project_id,
+        p.project_number,
+        p.project_name,
+        p.name AS project_name_alt,
+        p.contractor,
+        p.region,
+        p.financial_year,
+
+        awpl.lot_no,
+        awl.id AS workplan_line_id,
+        awl.road_id,
+        r.road_code,
+        r.road_name,
+
+        awl.activity_id,
+        a.code AS activity_code,
+        a.name AS activity_name,
+        a.unit AS unit_of_measure,
+        a.work_category,
+        a.work_description,
+
+        awl.category,
+        awl.method,
+        awl.chainage_start,
+        awl.chainage_end,
+        awl.planned_quantity,
+        awl.planned_rate,
+        awl.planned_amount
+      FROM annual_workplan_project_lots awpl
+      JOIN projects p
+        ON p.id = awpl.project_id
+      JOIN annual_workplan_lines awl
+        ON awl.workplan_id = awpl.workplan_id
+        AND awl.lot_no = awpl.lot_no
+        AND awl.category = awpl.category
+      JOIN roads r
+        ON r.id = awl.road_id
+      JOIN activities a
+        ON a.id = awl.activity_id
+      WHERE p.id = ?
+        AND awl.status <> 'cancelled'
+        AND awl.is_ignored = 0
+      ORDER BY r.road_name ASC, a.code ASC, awl.id ASC
+      `,
+      [projectId]
+    );
+
+    return res.json({
+      success: true,
+      arwpLines: rows,
+    });
+  } catch (err) {
+    console.error("ARWP lines for work instruction error:", err);
+    return res.status(500).json({
+      message: "Failed to load ARWP activity lines.",
+    });
+  }
+});
+
+// GET /api/work-instructions/project/:projectId/:instructionNumber
+router.get("/project/:projectId/:instructionNumber", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = Number(req.params.projectId);
+    const instructionNumber = String(req.params.instructionNumber || "").trim();
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Invalid project id." });
+    }
+
+    if (!instructionNumber) {
+      return res.status(400).json({ message: "instructionNumber is required." });
+    }
+
+    const allowed = await canViewProjectInstructions(req.user, projectId);
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view this site instruction.",
+      });
+    }
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        wi.*,
+        p.project_number,
+        p.project_name,
+        p.name AS project_name_alt,
+        p.contractor AS project_contractor,
+        p.region AS project_region,
+        issued.username AS issued_by_username,
+        issued.full_name AS issued_by_name,
+        issued_to.username AS issued_to_username,
+        issued_to.full_name AS issued_to_name
+      FROM work_instructions wi
+      LEFT JOIN projects p
+        ON p.id = wi.project_id
+      LEFT JOIN users issued
+        ON issued.id = wi.issued_by
+      LEFT JOIN users issued_to
+        ON issued_to.id = wi.issued_to_user_id
+      WHERE wi.project_id = ?
+        AND wi.instruction_number = ?
+      ORDER BY wi.id ASC
+      `,
+      [projectId, instructionNumber]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Site instruction not found." });
+    }
+
+    return res.json({
+      success: true,
+      instruction_number: instructionNumber,
+      lines: rows,
+    });
+  } catch (err) {
+    console.error("Work instruction detail error:", err);
+    return res.status(500).json({ message: "Failed to load site instruction." });
+  }
+});
+
+// POST /api/work-instructions
+// R.E/Admin creates/imports a site instruction with one or more lines.
+router.post("/", authenticateJWT, async (req, res) => {
+  const conn = await db.getConnection();
+
+  try {
+    const {
+      project_id,
+      instruction_number,
+      d365_instruction_no,
+      sheet_no,
+      instruction_date,
+      source,
+      issued_to_user_id,
+      note,
+      lines,
+    } = req.body || {};
+
+    const projectId = Number(project_id);
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Valid project_id is required." });
+    }
+
+    const allowed = await canCreateProjectInstruction(req.user, projectId);
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "Only the assigned R.E or Admin can create site instructions.",
+      });
+    }
+
+    if (!instruction_date) {
+      return res.status(400).json({
+        message: "instruction_date is required.",
+      });
+    }
+
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return res.status(400).json({
+        message: "At least one instructed work line is required.",
+      });
+    }
+
+    const project = await getProject(projectId);
+
+    if (!project) {
+      return res.status(404).json({ message: "Project not found." });
+    }
+
+    const assignment = await getWorkflowAssignment(projectId);
+    const finalIssuedToUserId =
+        issued_to_user_id || assignment?.siteagent_id || null;
+
+    const finalInstructionNumber =
+      String(d365_instruction_no || instruction_number || "").trim() ||
+      makeTempInstructionNumber();
+
+    const finalSource =
+      d365_instruction_no || instruction_number
+        ? String(source || "D365_IMPORT").toUpperCase()
+        : "BARABARA_CREATED";
+
+    await conn.beginTransaction();
+
+    const insertedIds = [];
+
+    for (const line of lines) {
+      const [result] = await conn.query(
+        `
+        INSERT INTO work_instructions
+          (
+            workplan_line_id,
+            project_id,
+            project_name_snapshot,
+            road_id,
+            road_code_snapshot,
+            road_name_snapshot,
+            contract_no_snapshot,
+            contractor_snapshot,
+            from_role,
+            to_role,
+            activity_id,
+            instruction_number,
+            sheet_no,
+            d365_instruction_no,
+            source,
+            instruction_date,
+            instructed_quantity,
+            instructed_rate,
+            status,
+            issued_by,
+            issued_to_user_id,
+            notes,
+            bill_no,
+            bill_item_no,
+            bill_item_description,
+            unit_of_measure,
+            section_text,
+            estimated_quantity,
+            additional_instruction_notes
+          )
+        VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          line.workplan_line_id || null,
+          projectId,
+          line.project_name_snapshot ||
+            project.project_name ||
+            project.name ||
+            null,
+
+          line.road_id || null,
+          line.road_code_snapshot || line.road_code || null,
+          line.road_name_snapshot || line.road_name || null,
+          line.contract_no_snapshot || project.project_number || null,
+          line.contractor_snapshot || project.contractor || null,
+
+          line.from_role || "RESIDENT ENGINEER",
+          line.to_role || "SITE AGENT",
+
+          line.activity_id || null,
+
+          finalInstructionNumber,
+          sheet_no || null,
+          d365_instruction_no || null,
+          finalSource,
+
+          instruction_date,
+          line.instructed_quantity || line.estimated_quantity || 0,
+          line.instructed_rate || 0,
+
+          req.user.id,
+          finalIssuedToUserId || line.issued_to_user_id || null,
+          line.notes || note || null,
+
+          line.bill_no || null,
+          line.bill_item_no || null,
+          line.bill_item_description || line.description || null,
+          line.unit_of_measure || null,
+          line.section_text || line.section || null,
+          line.estimated_quantity || line.instructed_quantity || null,
+          line.additional_instruction_notes || null,
+        ]
+      );
+
+      insertedIds.push(result.insertId);
+    }
+
+    await conn.commit();
+
+    return res.status(201).json({
+      success: true,
+      message: "Site instruction saved.",
+      instruction_number: finalInstructionNumber,
+      inserted_ids: insertedIds,
+    });
+  } catch (err) {
+    await conn.rollback();
+
+    console.error("Work instruction create error:", err);
+    return res.status(500).json({
+      message: "Failed to save site instruction.",
+    });
+  } finally {
+    conn.release();
+  }
+});
+
+module.exports = router;

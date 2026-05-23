@@ -24,6 +24,7 @@ const annualWorkplanRoutes = require("./routes/annualWorkplans");
 const weatherRoute = require("./routes/weatherRoute");
 const projectMediaRoute = require("./routes/projectMediaRoute");
 const path = require("path");
+const workInstructionsRoute = require("./routes/workInstructionsRoute");
 
 
 
@@ -76,6 +77,7 @@ app.use("/api/annual-workplans", annualWorkplanRoutes);
 app.use("/api/weather", weatherRoute);
 app.use("/api/project-media", projectMediaRoute);
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+app.use("/api/work-instructions", workInstructionsRoute);
 
 
 
