@@ -112,7 +112,36 @@ async function resolveProjectId({ project_id, project_number }) {
  * Site Agent creates draft -> submits to Inspector -> Inspector confirms -> ARE -> RE
  */
 const statusTracker = (report) => {
-  const s = report.status;
+  const s = String(report.status || "");
+  const changeRequested = Number(report.change_requested || 0) === 1;
+
+  if (changeRequested) {
+    const changeMap = {
+      SUBMITTED: {
+        stage: 2,
+        label: "Change Requested",
+        nextRole: "siteagent",
+        nextAction: "Amend and resubmit",
+        waitingFor: "Site Agent to amend and resubmit",
+      },
+      CONFIRMED: {
+        stage: 3,
+        label: "Change Requested",
+        nextRole: "inspector",
+        nextAction: "Review requested change",
+        waitingFor: "Inspector to review requested changes",
+      },
+      ARE_APPROVED: {
+        stage: 4,
+        label: "Change Requested",
+        nextRole: "are",
+        nextAction: "Review requested change",
+        waitingFor: "A.R.E to review requested changes",
+      },
+    };
+
+    if (changeMap[s]) return changeMap[s];
+  }
 
   const map = {
     DRAFT: {
@@ -164,7 +193,7 @@ const statusTracker = (report) => {
 };
 
 /**
- * Action logger -> writes into daily_work_reports_actions (NEW table you created)
+ * Action logger -> writes into daily_work_reports_actions (NEW table created)
  */
 const logDwrAction = async ({
   reportId,
@@ -573,11 +602,35 @@ router.post("/", authenticateJWT, async (req, res) => {
 
     const jsonStr = safeJsonStringify(form_json);
 
-    // Prevent duplicate by project/date
-    const [existing] = await db.query(
-      "SELECT * FROM daily_work_reports WHERE project_id = ? AND report_date = ?",
-      [resolvedProjectId, report_date]
-    );
+    // Prevent duplicate daily reports for the same project/date
+        const [existing] = await db.query(
+          `
+          SELECT *
+          FROM daily_work_reports
+          WHERE project_id = ?
+            AND report_date = ?
+          ORDER BY id DESC
+          LIMIT 1
+          `,
+          [resolvedProjectId, report_date]
+        );
+
+        if (existing.length > 0) {
+          const existingReport = await getReportWithParsed(existing[0].id);
+
+          if (String(existing[0].status) === "DRAFT") {
+            return res.status(200).json({
+              message: "Draft already exists for this project and date.",
+              report: existingReport,
+            });
+          }
+
+          return res.status(409).json({
+            message:
+              "A daily report already exists for this project and date. Use the existing report instead of creating another draft.",
+            report: existingReport,
+          });
+        }
 
     if (existing.length > 0) {
       return res.status(409).json({
@@ -628,7 +681,10 @@ router.post("/", authenticateJWT, async (req, res) => {
 });
 
 /**
- * UPDATE (Site Agent only) when status = DRAFT
+ * UPDATE (Site Agent only)
+ * Allows:
+ * - DRAFT update
+ * - SUBMITTED + change_requested = 1 amendment
  * PUT /api/daily-work-reports/:id
  * body: { form_json, contract_id? }
  */
@@ -641,36 +697,54 @@ router.put("/:id", authenticateJWT, async (req, res) => {
     const report = await getReport(req.params.id);
     if (!report) return res.status(404).json({ message: "Report not found" });
 
-    if (String(report.status) !== "DRAFT") {
-      return res.status(409).json({ message: "Only DRAFT reports can be edited" });
+    const isDraft = String(report.status) === "DRAFT";
+    const isAmendment =
+      String(report.status) === "SUBMITTED" &&
+      Number(report.change_requested || 0) === 1;
+
+    if (!isDraft && !isAmendment) {
+      return res.status(409).json({
+        message:
+          "Only DRAFT reports or change-requested SUBMITTED reports can be edited by Site Agent.",
+      });
     }
 
     const assignment = await getAssignment(report.project_id);
     if (!assignment || String(assignment.siteagent_id) !== String(req.user.id)) {
-      return res.status(403).json({ message: "You are not the assigned Site Agent for this project" });
+      return res.status(403).json({
+        message: "You are not the assigned Site Agent for this project",
+      });
     }
 
     const { form_json, contract_id } = req.body;
     const jsonStr = safeJsonStringify(form_json);
 
+    const amendedAt = isAmendment ? nowSql() : null;
+
     await db.query(
       `
       UPDATE daily_work_reports
-      SET form_json = ?, contract_id = COALESCE(?, contract_id)
+      SET form_json = ?,
+          contract_id = COALESCE(?, contract_id),
+          amended_at = COALESCE(?, amended_at)
       WHERE id = ?
       `,
-      [jsonStr, contract_id ?? null, report.id]
+      [jsonStr, contract_id ?? null, amendedAt, report.id]
     );
 
     await logDwrAction({
       reportId: report.id,
-      actionType: "UPDATED_DRAFT",
+      actionType: isAmendment ? "AMENDED_AFTER_CHANGE_REQUEST" : "UPDATED_DRAFT",
       userId: req.user.id,
       userRole: req.user.role,
     });
 
     const updated = await getReportWithParsed(report.id);
-    return res.json({ message: "Draft updated", report: updated });
+
+    return res.json({
+      message: isAmendment ? "Amendment saved" : "Draft updated",
+      report: updated,
+    });
   } catch (err) {
     console.error("❌ daily-work-reports update error:", err);
     return res.status(500).json({ message: "Server error" });
@@ -722,7 +796,10 @@ router.delete("/:id", authenticateJWT, async (req, res) => {
 });
 
 /**
- * SUBMIT (Site Agent) DRAFT -> SUBMITTED
+ * SUBMIT (Site Agent)
+ * Allows:
+ * - DRAFT -> SUBMITTED
+ * - SUBMITTED + change_requested = 1 -> SUBMITTED + change_requested = 0
  * PUT /api/daily-work-reports/:id/submit
  */
 router.put("/:id/submit", authenticateJWT, async (req, res) => {
@@ -734,34 +811,60 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
     const report = await getReport(req.params.id);
     if (!report) return res.status(404).json({ message: "Report not found" });
 
-    if (String(report.status) !== "DRAFT") {
-      return res.status(409).json({ message: "Only DRAFT reports can be submitted" });
+    const isDraft = String(report.status) === "DRAFT";
+    const isAmendment =
+      String(report.status) === "SUBMITTED" &&
+      Number(report.change_requested || 0) === 1;
+
+    if (!isDraft && !isAmendment) {
+      return res.status(409).json({
+        message:
+          "Only DRAFT reports or change-requested SUBMITTED reports can be submitted.",
+      });
     }
 
     const assignment = await getAssignment(report.project_id);
     if (!assignment || String(assignment.siteagent_id) !== String(req.user.id)) {
-      return res.status(403).json({ message: "You are not the assigned Site Agent for this project" });
+      return res.status(403).json({
+        message: "You are not the assigned Site Agent for this project",
+      });
     }
+
+    const submitTime = nowSql();
+    const amendedAt = isAmendment ? submitTime : null;
 
     await db.query(
       `
       UPDATE daily_work_reports
-      SET status = 'SUBMITTED', submitted_at = ?
+      SET status = 'SUBMITTED',
+          submitted_at = ?,
+          change_requested = 0,
+          change_request_notes = NULL,
+          change_requested_by = NULL,
+          change_requested_role = NULL,
+          change_requested_at = NULL,
+          amended_at = COALESCE(?, amended_at)
       WHERE id = ?
       `,
-      [nowSql(), report.id]
+      [submitTime, amendedAt, report.id]
     );
 
     await logDwrAction({
       reportId: report.id,
-      actionType: "SUBMITTED",
+      actionType: isAmendment ? "AMENDED_RESUBMITTED" : "SUBMITTED",
       userId: req.user.id,
       userRole: req.user.role,
       notes: req.body?.notes || null,
     });
 
     const updated = await getReportWithParsed(report.id);
-    return res.json({ message: "Submitted to Inspector", report: updated });
+
+    return res.json({
+      message: isAmendment
+        ? "Amendment resubmitted to Inspector"
+        : "Submitted to Inspector",
+      report: updated,
+    });
   } catch (err) {
     console.error("❌ submit error:", err);
     return res.status(500).json({ message: "Server error" });
@@ -817,6 +920,122 @@ router.put("/:id/confirm", authenticateJWT, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
+
+/**
+ * REQUEST CHANGE
+ * Inspector: SUBMITTED -> stays SUBMITTED, change_requested = 1
+ * ARE: CONFIRMED -> stays CONFIRMED, change_requested = 1
+ * RE: ARE_APPROVED -> stays ARE_APPROVED, change_requested = 1
+ * PUT /api/daily-work-reports/:id/request-change
+ * body: { notes }
+ */
+router.put("/:id/request-change", authenticateJWT, async (req, res) => {
+  try {
+    const userRole = String(req.user.role || "").toLowerCase();
+
+    const rules = {
+      inspector: {
+        expectedStatus: "SUBMITTED",
+        assignmentColumn: "inspector_id",
+        actionType: "INSPECTOR_REQUESTED_CHANGE",
+        targetRole: "Site Agent",
+      },
+      are: {
+        expectedStatus: "CONFIRMED",
+        assignmentColumn: "are_id",
+        actionType: "ARE_REQUESTED_CHANGE",
+        targetRole: "Inspector",
+      },
+      re: {
+        expectedStatus: "ARE_APPROVED",
+        assignmentColumn: "re_id",
+        actionType: "RE_REQUESTED_CHANGE",
+        targetRole: "A.R.E",
+      },
+    };
+
+    const rule = rules[userRole];
+
+    if (!rule) {
+      return res.status(403).json({
+        message: "Only Inspector, A.R.E, or R.E can request changes",
+      });
+    }
+
+    const report = await getReport(req.params.id);
+    if (!report) {
+      return res.status(404).json({ message: "Report not found" });
+    }
+
+    if (String(report.status) !== rule.expectedStatus) {
+      return res.status(409).json({
+        message: `This report must be ${rule.expectedStatus} before ${userRole.toUpperCase()} can request changes.`,
+      });
+    }
+
+    if (Number(report.change_requested || 0) === 1) {
+      return res.status(409).json({
+        message: "This report already has a pending change request.",
+      });
+    }
+
+    const assignment = await getAssignment(report.project_id);
+    if (
+      !assignment ||
+      String(assignment[rule.assignmentColumn] || "") !== String(req.user.id)
+    ) {
+      return res.status(403).json({
+        message: `You are not the assigned ${userRole.toUpperCase()} for this project`,
+      });
+    }
+
+    const { notes } = req.body || {};
+
+    if (!notes || !String(notes).trim()) {
+      return res.status(400).json({
+        message: "Please provide instructions for the requested change.",
+      });
+    }
+
+    await db.query(
+      `
+      UPDATE daily_work_reports
+      SET change_requested = 1,
+          change_request_notes = ?,
+          change_requested_by = ?,
+          change_requested_role = ?,
+          change_requested_at = ?
+      WHERE id = ?
+      `,
+      [
+        String(notes).trim(),
+        req.user.id,
+        req.user.role || userRole,
+        nowSql(),
+        report.id,
+      ]
+    );
+
+    await logDwrAction({
+      reportId: report.id,
+      actionType: rule.actionType,
+      userId: req.user.id,
+      userRole: req.user.role,
+      notes: String(notes).trim(),
+    });
+
+    const updated = await getReportWithParsed(report.id);
+
+    return res.json({
+      message: `Change requested. Report sent back to ${rule.targetRole} with notes.`,
+      report: updated,
+    });
+  } catch (err) {
+    console.error("❌ request-change error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
 router.put("/:id/inspector-edit", authenticateJWT, async (req, res) => {
   try {
     // Only Inspector can edit at this stage
@@ -835,6 +1054,13 @@ router.put("/:id/inspector-edit", authenticateJWT, async (req, res) => {
     // Only SUBMITTED reports can be edited by Inspector
     if (String(report.status) !== "SUBMITTED") {
       return res.status(409).json({ message: "Only SUBMITTED reports can be edited by Inspector" });
+    }
+
+    if (Number(report.change_requested || 0) === 1) {
+      return res.status(409).json({
+        message:
+          "This report has a pending change request. Site Agent must amend and resubmit before Inspector approval.",
+      });
     }
 
     // Must be assigned inspector for this project
@@ -893,6 +1119,13 @@ router.put("/:id/are-approve", authenticateJWT, async (req, res) => {
       return res.status(409).json({ message: "Only CONFIRMED reports can be ARE approved" });
     }
 
+    if (Number(report.change_requested || 0) === 1) {
+      return res.status(409).json({
+        message:
+          "This report has a pending change request. It must be resolved before A.R.E approval.",
+      });
+    }
+
     const assignment = await getAssignment(report.project_id);
     if (!assignment || String(assignment.are_id) !== String(req.user.id)) {
       return res.status(403).json({ message: "You are not the assigned ARE for this project" });
@@ -941,6 +1174,13 @@ router.put("/:id/re-approve", authenticateJWT, async (req, res) => {
 
     if (String(report.status) !== "ARE_APPROVED") {
       return res.status(409).json({ message: "Only ARE_APPROVED reports can be RE approved" });
+    }
+
+    if (Number(report.change_requested || 0) === 1) {
+      return res.status(409).json({
+        message:
+          "This report has a pending change request. It must be resolved before R.E final approval.",
+      });
     }
 
     const assignment = await getAssignment(report.project_id);

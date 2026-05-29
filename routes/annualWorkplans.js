@@ -20,6 +20,70 @@ const upload = multer({ dest: uploadDir });
 
 router.use(authenticateJWT);
 
+function normalizeFYForCompare(value) {
+  const text = String(value || "").trim();
+
+  if (/^\d{4}\/\d{2}$/.test(text)) {
+    return text;
+  }
+
+  if (/^\d{4}-\d{2}$/.test(text)) {
+    return `${text.slice(0, 4)}/${text.slice(-2)}`;
+  }
+
+  if (/^\d{4}-\d{4}$/.test(text)) {
+    return `${text.slice(0, 4)}/${text.slice(-2)}`;
+  }
+
+  return text;
+}
+
+async function handleActiveWorkplanByRegion(req, res) {
+  try {
+    const rawFY = req.query.financial_year;
+    const rawRegion = req.query.region;
+
+    if (!rawFY || !rawRegion) {
+      return res.status(400).json({
+        message: "financial_year and region are required",
+      });
+    }
+
+    const financialYear = normalizeFYForCompare(rawFY);
+    const region = String(rawRegion || "").trim();
+
+    const [rows] = await db.query(
+      `
+        SELECT *
+        FROM annual_workplans
+        WHERE REPLACE(financial_year, '-', '/') = REPLACE(?, '-', '/')
+          AND LOWER(TRIM(region)) = LOWER(TRIM(?))
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [financialYear, region]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        message: `No annual workplan found for ${financialYear} and ${region}`,
+      });
+    }
+
+    return res.json(rows[0]);
+  } catch (error) {
+    console.error("Error fetching active regional ARWP:", error);
+    return res.status(500).json({
+      message: "Failed to fetch active regional ARWP",
+      error: error.message,
+    });
+  }
+}
+
+// Support both old and new frontend URLs.
+router.get("/active", handleActiveWorkplanByRegion);
+router.get("/active/by-region", handleActiveWorkplanByRegion);
+
 /**
  * GET /api/annual-workplans
  * List annual workplans with line count and total amount.
@@ -848,11 +912,15 @@ function normalizeActivityCode(value) {
 
   if (!text) return "";
 
-  return text.replace(/\s+/g, "").replace(/\./g, "-");
+  return text
+    .replace(/\s+/g, "")
+    .replace(/-/g, ".")
+    .replace(/\.+/g, ".");
 }
+
 function looksLikeActivityCode(value) {
   const text = normalizeActivityCode(value);
-  return /^\d{2}-\d{2}-\d{3}[A-Za-z0-9]*$/.test(text);
+  return /^\d{2}\.\d{2}\.\d{3}[A-Za-z0-9]*$/.test(text);
 }
 
 async function getOrCreateWorkplanId(connection, financialYear, region, title, createdBy) {
@@ -2064,44 +2132,7 @@ router.put("/lines/:lineId/type", async (req, res) => {
     });
   }
 });
-// GET /api/annual-workplans/active?financial_year=2025/26&region=Coast
-router.get("/active/by-region", async (req, res) => {
-  try {
-    const { financial_year, region } = req.query;
 
-    if (!financial_year || !region) {
-      return res.status(400).json({
-        message: "financial_year and region are required",
-      });
-    }
-
-    const [rows] = await db.query(
-      `
-        SELECT *
-        FROM annual_workplans
-        WHERE financial_year = ?
-          AND region = ?
-        ORDER BY id DESC
-        LIMIT 1
-      `,
-      [financial_year, region]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({
-        message: "No annual workplan found for this financial year and region",
-      });
-    }
-
-    res.json(rows[0]);
-  } catch (error) {
-    console.error("Error fetching active regional ARWP:", error);
-    res.status(500).json({
-      message: "Failed to fetch active regional ARWP",
-      error: error.message,
-    });
-  }
-});
 function getARWPSheetName(financialYear) {
   const text = String(financialYear || "").trim();
   const match = text.match(/^(\d{4})\/(\d{2})$/);
