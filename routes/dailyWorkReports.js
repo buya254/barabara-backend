@@ -602,40 +602,30 @@ router.post("/", authenticateJWT, async (req, res) => {
 
     const jsonStr = safeJsonStringify(form_json);
 
-    // Prevent duplicate daily reports for the same project/date
-        const [existing] = await db.query(
-          `
-          SELECT *
-          FROM daily_work_reports
-          WHERE project_id = ?
-            AND report_date = ?
-          ORDER BY id DESC
-          LIMIT 1
-          `,
-          [resolvedProjectId, report_date]
-        );
+    // Create/Open Today should only reuse an existing NORMAL draft.
+    // Submitted reports should not block a new blank draft.
+    const [existingDraft] = await db.query(
+      `
+      SELECT *
+      FROM daily_work_reports
+      WHERE project_id = ?
+        AND report_date = ?
+        AND created_by = ?
+        AND status = 'DRAFT'
+        AND submitted_at IS NULL
+        AND amendment_of_report_id IS NULL
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [resolvedProjectId, report_date, String(req.user.id)]
+    );
 
-        if (existing.length > 0) {
-          const existingReport = await getReportWithParsed(existing[0].id);
+    if (existingDraft.length > 0) {
+      const existingReport = await getReportWithParsed(existingDraft[0].id);
 
-          if (String(existing[0].status) === "DRAFT") {
-            return res.status(200).json({
-              message: "Draft already exists for this project and date.",
-              report: existingReport,
-            });
-          }
-
-          return res.status(409).json({
-            message:
-              "A daily report already exists for this project and date. Use the existing report instead of creating another draft.",
-            report: existingReport,
-          });
-        }
-
-    if (existing.length > 0) {
-      return res.status(409).json({
-        message: "A report already exists for this project and date",
-        report: existing[0],
+      return res.status(200).json({
+        message: "Draft already exists for this project and date.",
+        report: existingReport,
       });
     }
 
@@ -645,6 +635,8 @@ router.post("/", authenticateJWT, async (req, res) => {
         INSERT INTO daily_work_reports
           (
             user_report_no,
+            amendment_of_report_id,
+            amendment_type,
             project_id,
             contract_id,
             report_date,
@@ -652,7 +644,7 @@ router.post("/", authenticateJWT, async (req, res) => {
             form_json,
             created_by
           )
-        VALUES (?, ?, ?, ?, 'DRAFT', ?, ?)
+        VALUES (?, NULL, NULL, ?, ?, ?, 'DRAFT', ?, ?)
       `;
 
       const [result] = await db.query(insertSql, [
@@ -681,6 +673,119 @@ router.post("/", authenticateJWT, async (req, res) => {
 });
 
 /**
+ * CREATE AMENDMENT DRAFT
+ * Clones a submitted change-requested report into a new editable DRAFT.
+ * POST /api/daily-work-reports/:id/create-amendment
+ */
+router.post("/:id/create-amendment", authenticateJWT, async (req, res) => {
+  try {
+    if (!isRole(req.user, "siteagent")) {
+      return res.status(403).json({
+        message: "Only Site Agent can create amendment drafts",
+      });
+    }
+
+    const sourceReport = await getReport(req.params.id);
+    if (!sourceReport) {
+      return res.status(404).json({ message: "Original report not found" });
+    }
+
+    if (String(sourceReport.status) !== "SUBMITTED") {
+      return res.status(409).json({
+        message: "Only SUBMITTED reports can be amended.",
+      });
+    }
+
+    if (Number(sourceReport.change_requested || 0) !== 1) {
+      return res.status(409).json({
+        message: "This report does not have a pending change request.",
+      });
+    }
+
+    const assignment = await getAssignment(sourceReport.project_id);
+    if (
+      !assignment ||
+      String(assignment.siteagent_id) !== String(req.user.id)
+    ) {
+      return res.status(403).json({
+        message: "You are not the assigned Site Agent for this project",
+      });
+    }
+
+    // If an amendment draft already exists for this original report, open it.
+    const [existingDraft] = await db.query(
+      `
+      SELECT *
+      FROM daily_work_reports
+      WHERE amendment_of_report_id = ?
+        AND status = 'DRAFT'
+        AND submitted_at IS NULL
+        AND created_by = ?
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [sourceReport.id, String(req.user.id)]
+    );
+
+    if (existingDraft.length > 0) {
+      const existing = await getReportWithParsed(existingDraft[0].id);
+      return res.status(200).json({
+        message: "Amendment draft already exists.",
+        report: existing,
+      });
+    }
+
+    const nextUserReportNo = await getNextUserReportNo(req.user.id);
+
+    const [result] = await db.query(
+      `
+      INSERT INTO daily_work_reports
+        (
+          user_report_no,
+          amendment_of_report_id,
+          amendment_type,
+          project_id,
+          contract_id,
+          report_date,
+          status,
+          change_requested,
+          form_json,
+          created_by
+        )
+      VALUES (?, ?, 'CHANGE_REQUEST', ?, ?, ?, 'DRAFT', 0, ?, ?)
+      `,
+      [
+        nextUserReportNo,
+        sourceReport.id,
+        sourceReport.project_id,
+        sourceReport.contract_id || null,
+        sourceReport.report_date,
+        sourceReport.form_json || "{}",
+        String(req.user.id),
+      ]
+    );
+
+    await logDwrAction({
+      reportId: result.insertId,
+      actionType: "AMENDMENT_DRAFT_CREATED",
+      userId: req.user.id,
+      userRole: req.user.role,
+      notes: `Created from report ID ${sourceReport.id}`,
+    });
+
+    const created = await getReportWithParsed(result.insertId);
+
+    return res.status(201).json({
+      message: "Amendment draft created.",
+      report: created,
+    });
+  } catch (err) {
+    console.error("❌ create amendment draft error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/**
  * UPDATE (Site Agent only)
  * Allows:
  * - DRAFT update
@@ -698,14 +803,12 @@ router.put("/:id", authenticateJWT, async (req, res) => {
     if (!report) return res.status(404).json({ message: "Report not found" });
 
     const isDraft = String(report.status) === "DRAFT";
-    const isAmendment =
-      String(report.status) === "SUBMITTED" &&
-      Number(report.change_requested || 0) === 1;
+    const isAmendmentDraft =
+      isDraft && Number(report.amendment_of_report_id || 0) > 0;
 
-    if (!isDraft && !isAmendment) {
+    if (!isDraft) {
       return res.status(409).json({
-        message:
-          "Only DRAFT reports or change-requested SUBMITTED reports can be edited by Site Agent.",
+        message: "Only DRAFT reports can be edited by Site Agent.",
       });
     }
 
@@ -719,7 +822,7 @@ router.put("/:id", authenticateJWT, async (req, res) => {
     const { form_json, contract_id } = req.body;
     const jsonStr = safeJsonStringify(form_json);
 
-    const amendedAt = isAmendment ? nowSql() : null;
+    const amendedAt = isAmendmentDraft ? nowSql() : null;
 
     await db.query(
       `
@@ -734,7 +837,7 @@ router.put("/:id", authenticateJWT, async (req, res) => {
 
     await logDwrAction({
       reportId: report.id,
-      actionType: isAmendment ? "AMENDED_AFTER_CHANGE_REQUEST" : "UPDATED_DRAFT",
+      actionType: isAmendmentDraft ? "UPDATED_AMENDMENT_DRAFT" : "UPDATED_DRAFT",
       userId: req.user.id,
       userRole: req.user.role,
     });
@@ -742,7 +845,7 @@ router.put("/:id", authenticateJWT, async (req, res) => {
     const updated = await getReportWithParsed(report.id);
 
     return res.json({
-      message: isAmendment ? "Amendment saved" : "Draft updated",
+      message: isAmendmentDraft ? "Amendment draft updated" : "Draft updated",
       report: updated,
     });
   } catch (err) {
@@ -766,9 +869,9 @@ router.delete("/:id", authenticateJWT, async (req, res) => {
       return res.status(404).json({ message: "Draft not found" });
     }
 
-    if (String(report.status) !== "DRAFT") {
+    if (String(report.status) !== "DRAFT" || report.submitted_at) {
       return res.status(409).json({
-        message: "Draft cannot be deleted in its current status.",
+        message: "Only drafts that have never been submitted can be deleted.",
       });
     }
 
@@ -812,14 +915,12 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
     if (!report) return res.status(404).json({ message: "Report not found" });
 
     const isDraft = String(report.status) === "DRAFT";
-    const isAmendment =
-      String(report.status) === "SUBMITTED" &&
-      Number(report.change_requested || 0) === 1;
+    const isAmendmentDraft =
+      isDraft && Number(report.amendment_of_report_id || 0) > 0;
 
-    if (!isDraft && !isAmendment) {
+    if (!isDraft) {
       return res.status(409).json({
-        message:
-          "Only DRAFT reports or change-requested SUBMITTED reports can be submitted.",
+        message: "Only DRAFT reports can be submitted.",
       });
     }
 
@@ -831,7 +932,7 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
     }
 
     const submitTime = nowSql();
-    const amendedAt = isAmendment ? submitTime : null;
+    const amendedAt = isAmendmentDraft ? submitTime : null;
 
     await db.query(
       `
@@ -851,16 +952,37 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
 
     await logDwrAction({
       reportId: report.id,
-      actionType: isAmendment ? "AMENDED_RESUBMITTED" : "SUBMITTED",
+      actionType: isAmendmentDraft ? "AMENDED_RESUBMITTED" : "SUBMITTED",
       userId: req.user.id,
       userRole: req.user.role,
       notes: req.body?.notes || null,
     });
 
+    if (report.amendment_of_report_id) {
+      await db.query(
+        `
+        UPDATE daily_work_reports
+        SET status = 'SUPERSEDED',
+            change_requested = 0,
+            superseded_by_report_id = ?
+        WHERE id = ?
+        `,
+        [report.id, report.amendment_of_report_id]
+      );
+
+      await logDwrAction({
+        reportId: report.amendment_of_report_id,
+        actionType: "SUPERSEDED_BY_AMENDMENT",
+        userId: req.user.id,
+        userRole: req.user.role,
+        notes: `Superseded by amended report ID ${report.id}`,
+      });
+    }
+
     const updated = await getReportWithParsed(report.id);
 
     return res.json({
-      message: isAmendment
+      message: isAmendmentDraft
         ? "Amendment resubmitted to Inspector"
         : "Submitted to Inspector",
       report: updated,
@@ -887,6 +1009,12 @@ router.put("/:id/confirm", authenticateJWT, async (req, res) => {
 
     if (String(report.status) !== "SUBMITTED") {
       return res.status(409).json({ message: "Only SUBMITTED reports can be confirmed" });
+    }
+    if (Number(report.change_requested || 0) === 1) {
+      return res.status(409).json({
+        message:
+          "This report has a pending change request. Site Agent must create and submit an amendment draft before Inspector approval.",
+      });
     }
 
     const assignment = await getAssignment(report.project_id);

@@ -117,7 +117,17 @@ async function canUploadToDailyReport(user, report) {
 
   if (!report) return false;
 
-  if (String(report.status) !== "DRAFT") return false;
+  const status = String(report.status || "").toUpperCase();
+  const changeRequested = Number(report.change_requested || 0) === 1;
+
+  const isDraft = status === "DRAFT";
+  const isSubmitted = status === "SUBMITTED";
+  const isChangeRequested = status === "SUBMITTED" && changeRequested;
+
+  const reportAllowsMedia =
+    isDraft || isSubmitted || isChangeRequested;
+
+  if (!reportAllowsMedia) return false;
 
   const assignment = await getWorkflowAssignment(report.project_id);
 
