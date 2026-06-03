@@ -234,6 +234,137 @@ async function getLastAction(reportId) {
   return rows[0] || null;
 }
 
+const PLANT_RETURN_ITEMS = [
+  "Motor Grader",
+  "Wheel Loader",
+  "Track Loader",
+  "Track Shovel",
+  "Bulldozer",
+  "Sheepfoot Roller",
+  "Vibrate Roller",
+  "Single Drum Steel Roller",
+  "Double Drum Steel Roller",
+  "Grid Roller",
+  "Water Tanker",
+  "Tippers",
+  "Truck",
+  "Concrete Mixer 0.1m3",
+  "Concrete Mixer 0.3m3",
+  "Concrete Mixer 0.6m3",
+  "Hand Roller",
+  "Tractor (Trailer)",
+  "Pulver Mixer",
+  "Rotavator + Tractor",
+  "Bitumen distributor",
+  "Hand Sprayer",
+  "Paver",
+  "Excavator",
+  "Poker Vibrator",
+  "Pneumatic Tyre Roller",
+  "Pavement Cutter",
+  "Plate Compactor",
+];
+
+function parseFormJsonFromDb(value) {
+  if (!value) return {};
+
+  if (typeof value === "object") {
+    return value;
+  }
+
+  if (Buffer.isBuffer(value)) {
+    try {
+      return JSON.parse(value.toString("utf8"));
+    } catch {
+      return {};
+    }
+  }
+
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
+}
+
+function toNumber(value) {
+  const n = Number(String(value ?? "").replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function cleanText(value) {
+  return String(value || "").trim();
+}
+
+function normalizePlantName(value) {
+  const raw = cleanText(value);
+  const key = raw.toLowerCase().replace(/\s+/g, " ");
+
+  const map = {
+    "motor grader": "Motor Grader",
+    "wheel loader": "Wheel Loader",
+    "backhoe loader": "Wheel Loader",
+    "track loader": "Track Loader",
+    "track shovel": "Track Shovel",
+    bulldozer: "Bulldozer",
+    "sheepfoot roller": "Sheepfoot Roller",
+    "vibrate roller": "Vibrate Roller",
+    "vibratory roller": "Vibrate Roller",
+    "single drum steel roller": "Single Drum Steel Roller",
+    "double drum steel roller": "Double Drum Steel Roller",
+    "grid roller": "Grid Roller",
+    "water tanker": "Water Tanker",
+    "water bowser/ tanker": "Water Tanker",
+    "water bowser/tanker": "Water Tanker",
+    "water bowser": "Water Tanker",
+    tippers: "Tippers",
+    "tipper truck": "Tippers",
+    truck: "Truck",
+    "dump truck": "Truck",
+    "concrete mixer 0.1 m³": "Concrete Mixer 0.1m3",
+    "concrete mixer 0.1m3": "Concrete Mixer 0.1m3",
+    "concrete mixer 0.3 m³": "Concrete Mixer 0.3m3",
+    "concrete mixer 0.3m3": "Concrete Mixer 0.3m3",
+    "concrete mixer 0.6 m³": "Concrete Mixer 0.6m3",
+    "concrete mixer 0.6m3": "Concrete Mixer 0.6m3",
+    "hand roller": "Hand Roller",
+    tractor: "Tractor (Trailer)",
+    "tractor with trailer": "Tractor (Trailer)",
+    "tractor (trailer)": "Tractor (Trailer)",
+    "pulver mixer": "Pulver Mixer",
+    "rotavator + tractor": "Rotavator + Tractor",
+    "bitumen distributor": "Bitumen distributor",
+    "asphalt distributor": "Bitumen distributor",
+    "hand sprayer": "Hand Sprayer",
+    paver: "Paver",
+    "asphalt paver": "Paver",
+    excavator: "Excavator",
+    "crawler excavator": "Excavator",
+    "mini excavator": "Excavator",
+    "poker vibrator": "Poker Vibrator",
+    "concrete vibrator": "Poker Vibrator",
+    "pneumatic tyre roller": "Pneumatic Tyre Roller",
+    "pneumatic tyred roller": "Pneumatic Tyre Roller",
+    "pavement cutter": "Pavement Cutter",
+    "plate compactor": "Plate Compactor",
+    compactor: "Plate Compactor",
+  };
+
+  return map[key] || raw;
+}
+
+function calculatePercentWorked(hoursWorked, hoursIdle, hoursBreakdown) {
+  const total = hoursWorked + hoursIdle + hoursBreakdown;
+
+  if (!total) return "";
+
+  return `${((hoursWorked / total) * 100).toFixed(1)}%`;
+}
+
 async function getNextUserReportNo(userId) {
   const [rows] = await db.query(
     `
@@ -301,6 +432,232 @@ router.get("/approved/view", authenticateJWT, async (req, res) => {
     return res.json(rows[0]);
   } catch (err) {
     console.error("❌ approved form read error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/**
+ * PLANT & EQUIPMENT RETURNS SUMMARY
+ * GET /api/daily-work-reports/plant-equipment-summary?project_id=&from_date=&to_date=
+ *
+ * Reads submitted/approved daily work reports and aggregates plantRows.
+ */
+router.get("/plant-equipment-summary", authenticateJWT, async (req, res) => {
+  try {
+    const { project_id, project_number, from_date, to_date } = req.query;
+
+    if (!from_date || !to_date) {
+      return res.status(400).json({
+        message: "from_date and to_date are required in YYYY-MM-DD format.",
+      });
+    }
+
+    const resolvedProjectId = await resolveProjectId({
+      project_id,
+      project_number,
+    });
+
+    if (!resolvedProjectId) {
+      return res.status(400).json({
+        message: "project_id or project_number is required.",
+      });
+    }
+
+    const assignment = await getAssignment(resolvedProjectId);
+    const userRole = String(req.user.role || "").toLowerCase();
+    const uid = String(req.user.id);
+
+    const [userProjectRows] = await db.query(
+      `
+      SELECT 1
+      FROM user_projects
+      WHERE user_id = ?
+        AND project_id = ?
+      LIMIT 1
+      `,
+      [req.user.id, resolvedProjectId]
+    );
+
+    const allowed =
+      userRole === "admin" ||
+      isAssignedToProject(req.user, assignment) ||
+      userProjectRows.length > 0;
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view plant returns for this project.",
+      });
+    }
+
+    const [projectRows] = await db.query(
+      `
+      SELECT
+        p.id,
+        p.project_number,
+        p.project_name,
+        p.name,
+        p.contractor,
+        p.region,
+        c.id AS contract_id,
+        c.contract_name
+      FROM projects p
+      LEFT JOIN contracts c
+        ON c.project_id = p.id
+      WHERE p.id = ?
+      ORDER BY c.id DESC
+      LIMIT 1
+      `,
+      [resolvedProjectId]
+    );
+
+    const project = projectRows[0] || null;
+
+    const [reportRows] = await db.query(
+      `
+      SELECT
+        id,
+        user_report_no,
+        project_id,
+        contract_id,
+        report_date,
+        status,
+        form_json,
+        created_by,
+        submitted_at,
+        confirmed_at,
+        are_approved_at,
+        re_approved_at
+      FROM daily_work_reports
+      WHERE project_id = ?
+        AND DATE(report_date) BETWEEN ? AND ?
+        AND status IN ('SUBMITTED', 'CONFIRMED', 'ARE_APPROVED', 'RE_APPROVED')
+        AND COALESCE(change_requested, 0) = 0
+      ORDER BY report_date ASC, id ASC
+      `,
+      [resolvedProjectId, from_date, to_date]
+    );
+
+    const summaryMap = new Map();
+
+    PLANT_RETURN_ITEMS.forEach((name, index) => {
+      summaryMap.set(name, {
+        no: index + 1,
+        machineryOnSite: name,
+        count: 0,
+        plateNumbers: new Set(),
+        hoursWorked: 0,
+        hoursIdle: 0,
+        hoursBreakdown: 0,
+        percentWorked: "",
+        remarks: "",
+      });
+    });
+
+    const extraItems = new Map();
+
+    reportRows.forEach((report) => {
+      const formJson = parseFormJsonFromDb(report.form_json);
+      const plantRows = Array.isArray(formJson.plantRows)
+        ? formJson.plantRows
+        : [];
+
+      plantRows.forEach((row) => {
+        const rawDescription = cleanText(row.description);
+        if (!rawDescription) return;
+
+        const normalizedName = normalizePlantName(rawDescription);
+
+        const targetMap = summaryMap.has(normalizedName)
+          ? summaryMap
+          : extraItems;
+
+        if (!targetMap.has(normalizedName)) {
+          targetMap.set(normalizedName, {
+            no: PLANT_RETURN_ITEMS.length + extraItems.size + 1,
+            machineryOnSite: normalizedName,
+            count: 0,
+            plateNumbers: new Set(),
+            hoursWorked: 0,
+            hoursIdle: 0,
+            hoursBreakdown: 0,
+            percentWorked: "",
+            remarks: "Other / not in standard KURA list",
+          });
+        }
+
+        const item = targetMap.get(normalizedName);
+
+        const plateNo = cleanText(row.plateNo);
+        if (plateNo) {
+          item.plateNumbers.add(plateNo.toUpperCase());
+        } else {
+          item.count += 1;
+        }
+
+        item.hoursWorked += toNumber(row.hoursWorked);
+        item.hoursIdle += toNumber(row.hoursIdle);
+        item.hoursBreakdown += toNumber(row.hoursBreakdown);
+      });
+    });
+
+    const finalizeItem = (item) => {
+      const uniquePlateCount = item.plateNumbers.size;
+      const fallbackCount = item.count;
+
+      const count = uniquePlateCount || fallbackCount || "";
+
+      return {
+        no: item.no,
+        machineryOnSite: item.machineryOnSite,
+        count,
+        hoursWorked: Number(item.hoursWorked.toFixed(2)),
+        hoursIdle: Number(item.hoursIdle.toFixed(2)),
+        hoursBreakdown: Number(item.hoursBreakdown.toFixed(2)),
+        percentWorked: calculatePercentWorked(
+          item.hoursWorked,
+          item.hoursIdle,
+          item.hoursBreakdown
+        ),
+        remarks: item.remarks || "",
+        plateNumbers: Array.from(item.plateNumbers),
+      };
+    };
+
+    const standardRows = Array.from(summaryMap.values()).map(finalizeItem);
+    const extraRows = Array.from(extraItems.values()).map(finalizeItem);
+
+    return res.json({
+      project: project
+        ? {
+            id: project.id,
+            project_number: project.project_number,
+            project_name: project.project_name || project.name || "",
+            name: project.name || project.project_name || "",
+            contractor: project.contractor || "",
+            region: project.region || "",
+            contract_id: project.contract_id || null,
+            contract_no: project.contract_name || project.project_number || "",
+          }
+        : {
+            id: resolvedProjectId,
+          },
+
+      period: {
+        from_date,
+        to_date,
+      },
+
+      reports_used: reportRows.map((r) => ({
+        id: r.id,
+        user_report_no: r.user_report_no,
+        report_date: r.report_date,
+        status: r.status,
+      })),
+
+      rows: [...standardRows, ...extraRows],
+    });
+  } catch (err) {
+    console.error("❌ plant-equipment-summary error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
