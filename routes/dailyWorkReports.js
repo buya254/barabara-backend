@@ -365,6 +365,80 @@ function calculatePercentWorked(hoursWorked, hoursIdle, hoursBreakdown) {
   return `${((hoursWorked / total) * 100).toFixed(1)}%`;
 }
 
+const LABOUR_RETURN_PERSONNEL = [
+  "Site Agent",
+  "Deputy Site Agents",
+  "Senior Foremen",
+  "Patch work Headmen",
+  "Concrete Foremen",
+  "Bitumen Foremen",
+  "Masonry Foremen",
+  "Carpentry Foreman",
+  "Levelers",
+  "Surveyors",
+  "Stone pitching Headmen",
+  "Concrete Works Headmen",
+  "Crusher Foremen",
+  "Blasters",
+  "Culverts/Gabion Headmen",
+  "Stabilization Foremen",
+  "Material Technicians",
+  "Assistant Surveyors",
+  "Site Clerks",
+  "High Power Electricians",
+  "Store Keepers",
+  "Security officers",
+  "Welders",
+  "Plant Mechanics",
+  "Pre-coating Mechanics",
+  "Crusher Mechanics",
+  "Crusher Operators",
+  "Motor vehicle Mechanics",
+  "Distributor operators",
+  "Dressers",
+  "Plant Operators",
+  "Drillers",
+  "Drivers",
+  "Auto Electricians",
+  "Masons",
+  "Concrete Mixer Operators",
+  "Time Keepers",
+  "Security Guards",
+  "Tyremen",
+  "Greasers",
+  "General Labourers",
+  "Spanner Boys",
+  "Chainmen",
+  "Fuel Attendants",
+  "Turn Boys",
+  "Carpenters",
+  "Students",
+  "Secretaries",
+  "",
+  "",
+];
+
+function calculateLabourPercent(part, total) {
+  if (!total) return "";
+  return `${((part / total) * 100).toFixed(1)}%`;
+}
+
+function makeEmptyLabourSummaryRows() {
+  return LABOUR_RETURN_PERSONNEL.map((personnel, index) => ({
+    no: index + 1,
+    personnel,
+    requiredNo: 0,
+    mobilized: 0,
+    balance: 0,
+    male: 0,
+    female: 0,
+    plwds: 0,
+    malePercent: "",
+    femalePercent: "",
+    plwdsPercent: "",
+  }));
+}
+
 async function getNextUserReportNo(userId) {
   const [rows] = await db.query(
     `
@@ -663,6 +737,234 @@ router.get("/plant-equipment-summary", authenticateJWT, async (req, res) => {
 });
 
 /**
+ * LABOUR RETURNS SUMMARY
+ * GET /api/daily-work-reports/labour-returns-summary?project_id=&from_date=&to_date=
+ *
+ * Reads submitted/approved daily work reports and aggregates labourReturnRows.
+ * Cumulative logic is person-days:
+ * same driver present for 7 days = 7 driver entries.
+ */
+router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
+  try {
+    const { project_id, project_number, from_date, to_date } = req.query;
+
+    if (!from_date || !to_date) {
+      return res.status(400).json({
+        message: "from_date and to_date are required in YYYY-MM-DD format.",
+      });
+    }
+
+    const resolvedProjectId = await resolveProjectId({
+      project_id,
+      project_number,
+    });
+
+    if (!resolvedProjectId) {
+      return res.status(400).json({
+        message: "project_id or project_number is required.",
+      });
+    }
+
+    const assignment = await getAssignment(resolvedProjectId);
+    const userRole = String(req.user.role || "").toLowerCase();
+
+    const [userProjectRows] = await db.query(
+      `
+      SELECT 1
+      FROM user_projects
+      WHERE user_id = ?
+        AND project_id = ?
+      LIMIT 1
+      `,
+      [req.user.id, resolvedProjectId]
+    );
+
+    const allowed =
+      userRole === "admin" ||
+      isAssignedToProject(req.user, assignment) ||
+      userProjectRows.length > 0;
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view labour returns for this project.",
+      });
+    }
+
+    const [projectRows] = await db.query(
+      `
+      SELECT
+        p.id,
+        p.project_number,
+        p.project_name,
+        p.name,
+        p.contractor,
+        p.region,
+        c.id AS contract_id,
+        c.contract_name
+      FROM projects p
+      LEFT JOIN contracts c
+        ON c.project_id = p.id
+      WHERE p.id = ?
+      ORDER BY c.id DESC
+      LIMIT 1
+      `,
+      [resolvedProjectId]
+    );
+
+    const project = projectRows[0] || null;
+
+    const [reportRows] = await db.query(
+      `
+      SELECT
+        id,
+        user_report_no,
+        project_id,
+        contract_id,
+        report_date,
+        status,
+        form_json,
+        created_by,
+        submitted_at,
+        confirmed_at,
+        are_approved_at,
+        re_approved_at
+      FROM daily_work_reports
+      WHERE project_id = ?
+        AND DATE(report_date) BETWEEN ? AND ?
+        AND status IN ('SUBMITTED', 'CONFIRMED', 'ARE_APPROVED', 'RE_APPROVED')
+        AND COALESCE(change_requested, 0) = 0
+      ORDER BY report_date ASC, id ASC
+      `,
+      [resolvedProjectId, from_date, to_date]
+    );
+
+    const summaryRows = makeEmptyLabourSummaryRows();
+
+    reportRows.forEach((report) => {
+      const formJson = parseFormJsonFromDb(report.form_json);
+      const labourReturnRows = Array.isArray(formJson.labourReturnRows)
+        ? formJson.labourReturnRows
+        : [];
+
+      labourReturnRows.forEach((row) => {
+        const rowNo = Number(row.no);
+
+        if (!Number.isInteger(rowNo) || rowNo < 1 || rowNo > 50) {
+          return;
+        }
+
+        const target = summaryRows[rowNo - 1];
+
+        // Allow rows 49 and 50 to carry custom personnel names.
+        if (rowNo >= 49 && cleanText(row.personnel)) {
+          target.personnel = cleanText(row.personnel);
+        }
+
+        const requiredNo = toNumber(row.requiredNo);
+        const male = toNumber(row.male);
+        const female = toNumber(row.female);
+        const plwds = toNumber(row.plwds);
+
+        target.requiredNo += requiredNo;
+        target.male += male;
+        target.female += female;
+        target.plwds += plwds;
+      });
+    });
+
+    let requiredTotal = 0;
+    let mobilizedTotal = 0;
+    let maleTotal = 0;
+    let femaleTotal = 0;
+    let plwdsTotal = 0;
+    let casualTotal = 0;
+    let skilledTotal = 0;
+
+    const finalizedRows = summaryRows.map((row) => {
+      const mobilized = row.male + row.female;
+      const balance = row.requiredNo - mobilized;
+
+      const finalRow = {
+        no: row.no,
+        personnel: row.personnel,
+        requiredNo: Number(row.requiredNo.toFixed(2)),
+        mobilized: Number(mobilized.toFixed(2)),
+        balance: Number(balance.toFixed(2)),
+        male: Number(row.male.toFixed(2)),
+        female: Number(row.female.toFixed(2)),
+        plwds: Number(row.plwds.toFixed(2)),
+        malePercent: calculateLabourPercent(row.male, mobilized),
+        femalePercent: calculateLabourPercent(row.female, mobilized),
+        plwdsPercent: calculateLabourPercent(row.plwds, mobilized),
+      };
+
+      requiredTotal += row.requiredNo;
+      mobilizedTotal += mobilized;
+      maleTotal += row.male;
+      femaleTotal += row.female;
+      plwdsTotal += row.plwds;
+
+      // Row 41 General Labourers + Row 47 Students = casual labourers.
+      if (row.no === 41 || row.no === 47) {
+        casualTotal += mobilized;
+      } else {
+        skilledTotal += mobilized;
+      }
+
+      return finalRow;
+    });
+
+    return res.json({
+      project: project
+        ? {
+            id: project.id,
+            project_number: project.project_number,
+            project_name: project.project_name || project.name || "",
+            name: project.name || project.project_name || "",
+            contractor: project.contractor || "",
+            region: project.region || "",
+            contract_id: project.contract_id || null,
+            contract_no: project.contract_name || project.project_number || "",
+          }
+        : {
+            id: resolvedProjectId,
+          },
+
+      period: {
+        from_date,
+        to_date,
+      },
+
+      reports_used: reportRows.map((r) => ({
+        id: r.id,
+        user_report_no: r.user_report_no,
+        report_date: r.report_date,
+        status: r.status,
+      })),
+
+      totals: {
+        requiredNo: Number(requiredTotal.toFixed(2)),
+        mobilized: Number(mobilizedTotal.toFixed(2)),
+        balance: Number((requiredTotal - mobilizedTotal).toFixed(2)),
+        male: Number(maleTotal.toFixed(2)),
+        female: Number(femaleTotal.toFixed(2)),
+        plwds: Number(plwdsTotal.toFixed(2)),
+        malePercent: calculateLabourPercent(maleTotal, mobilizedTotal),
+        femalePercent: calculateLabourPercent(femaleTotal, mobilizedTotal),
+        plwdsPercent: calculateLabourPercent(plwdsTotal, mobilizedTotal),
+        casualLabourers: Number(casualTotal.toFixed(2)),
+        skilledLabourers: Number(skilledTotal.toFixed(2)),
+      },
+
+      rows: finalizedRows,
+    });
+  } catch (err) {
+    console.error("❌ labour-returns-summary error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/**
  * GET list (role-filtered)
  * GET /api/daily-work-reports?project_id=&project_number=&status=&report_date=
  */
@@ -677,7 +979,7 @@ router.get("/", authenticateJWT, async (req, res) => {
         dwr.*,
 
         -- last action summary
-        la.last_action_at,
+        act.created_at AS last_action_at,
         act.action_type     AS last_action_type,
         act.action_by_role  AS last_action_role,
         act.notes           AS last_action_notes,
@@ -702,12 +1004,12 @@ router.get("/", authenticateJWT, async (req, res) => {
 
       FROM daily_work_reports dwr
       LEFT JOIN (
-        SELECT report_id, MAX(created_at) AS last_action_at
+        SELECT report_id, MAX(id) AS last_action_id
         FROM daily_work_reports_actions
         GROUP BY report_id
       ) la ON la.report_id = dwr.id
       LEFT JOIN daily_work_reports_actions act
-        ON act.report_id = dwr.id AND act.created_at = la.last_action_at
+        ON act.id = la.last_action_id
       LEFT JOIN users ua ON ua.id = act.action_by
 
       LEFT JOIN project_workflow_assignments pwa
