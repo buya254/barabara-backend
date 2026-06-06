@@ -163,6 +163,171 @@ router.get("/project/:projectId", authenticateJWT, async (req, res) => {
     return res.status(500).json({ message: "Failed to load site instructions." });
   }
 });
+
+// GET /api/work-instructions/project/:projectId/usage
+// Shows which work instruction lines have been used in Daily Work Reports.
+router.get("/project/:projectId/usage", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = Number(req.params.projectId);
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Invalid project id." });
+    }
+
+    const allowed = await canViewProjectInstructions(req.user, projectId);
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view work instruction usage for this project.",
+      });
+    }
+
+    const [instructionRows] = await db.query(
+      `
+      SELECT
+        wi.*,
+        p.project_number,
+        p.project_name,
+        p.name AS project_name_alt,
+        p.contractor AS project_contractor,
+        p.region AS project_region,
+        issued.username AS issued_by_username,
+        issued.full_name AS issued_by_name,
+        issued_to.username AS issued_to_username,
+        issued_to.full_name AS issued_to_name
+      FROM work_instructions wi
+      LEFT JOIN projects p
+        ON p.id = wi.project_id
+      LEFT JOIN users issued
+        ON issued.id = wi.issued_by
+      LEFT JOIN users issued_to
+        ON issued_to.id = wi.issued_to_user_id
+      WHERE wi.project_id = ?
+      ORDER BY
+        wi.instruction_date DESC,
+        wi.instruction_number DESC,
+        wi.id ASC
+      `,
+      [projectId]
+    );
+
+    const [reportRows] = await db.query(
+      `
+      SELECT
+        id,
+        user_report_no,
+        project_id,
+        report_date,
+        status,
+        form_json,
+        submitted_at,
+        confirmed_at,
+        are_approved_at,
+        re_approved_at
+      FROM daily_work_reports
+      WHERE project_id = ?
+        AND status IN ('DRAFT', 'SUBMITTED', 'CONFIRMED', 'ARE_APPROVED', 'RE_APPROVED')
+      ORDER BY report_date ASC, id ASC
+      `,
+      [projectId]
+    );
+
+    const usageByInstructionLineId = new Map();
+
+    const parseFormJson = (value) => {
+      if (!value) return {};
+
+      if (typeof value === "object") return value;
+
+      if (Buffer.isBuffer(value)) {
+        try {
+          return JSON.parse(value.toString("utf8"));
+        } catch {
+          return {};
+        }
+      }
+
+      if (typeof value === "string") {
+        try {
+          return JSON.parse(value);
+        } catch {
+          return {};
+        }
+      }
+
+      return {};
+    };
+
+    for (const report of reportRows) {
+      const formJson = parseFormJson(report.form_json);
+      const operationRows = Array.isArray(formJson.operationRows)
+        ? formJson.operationRows
+        : [];
+
+      operationRows.forEach((operation, index) => {
+        const lineId = Number(operation.workInstructionLineId);
+
+        if (!Number.isInteger(lineId) || lineId <= 0) return;
+
+        if (!usageByInstructionLineId.has(lineId)) {
+          usageByInstructionLineId.set(lineId, []);
+        }
+
+        usageByInstructionLineId.get(lineId).push({
+          report_id: report.id,
+          user_report_no: report.user_report_no,
+          report_date: report.report_date,
+          report_status: report.status,
+          operation_index: index,
+          chainage_from: operation.chainageFrom || "",
+          chainage_to: operation.chainageTo || "",
+          activity_description: operation.activityDescription || "",
+          remarks: operation.remarks || "",
+          submitted_at: report.submitted_at,
+          confirmed_at: report.confirmed_at,
+          are_approved_at: report.are_approved_at,
+          re_approved_at: report.re_approved_at,
+        });
+      });
+    }
+
+    const rows = instructionRows.map((instruction) => {
+      const usage = usageByInstructionLineId.get(Number(instruction.id)) || [];
+
+      let usageStatus = "DUE_FOR_EXECUTION";
+
+      if (usage.some((u) => u.report_status === "RE_APPROVED")) {
+        usageStatus = "USED_IN_RE_APPROVED_REPORT";
+      } else if (usage.some((u) => u.report_status === "ARE_APPROVED")) {
+        usageStatus = "USED_IN_ARE_APPROVED_REPORT";
+      } else if (usage.some((u) => u.report_status === "CONFIRMED")) {
+        usageStatus = "USED_IN_INSPECTOR_APPROVED_REPORT";
+      } else if (usage.some((u) => u.report_status === "SUBMITTED")) {
+        usageStatus = "USED_IN_SUBMITTED_REPORT";
+      } else if (usage.some((u) => u.report_status === "DRAFT")) {
+        usageStatus = "USED_IN_DRAFT";
+      }
+
+      return {
+        ...instruction,
+        usage_status: usageStatus,
+        usage_count: usage.length,
+        usage,
+      };
+    });
+
+    return res.json({
+      success: true,
+      instructions: rows,
+    });
+  } catch (err) {
+    console.error("Work instruction usage error:", err);
+    return res.status(500).json({
+      message: "Failed to load work instruction usage.",
+    });
+  }
+});
+
 // GET /api/work-instructions/project/:projectId/arwp-lines
 // R.E uses this to pick ARWP activity placeholders when creating a Site Instruction.
 router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) => {

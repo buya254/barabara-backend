@@ -1349,9 +1349,12 @@ router.post("/:id/create-amendment", authenticateJWT, async (req, res) => {
       return res.status(404).json({ message: "Original report not found" });
     }
 
-    if (String(sourceReport.status) !== "SUBMITTED") {
+    const amendableStatuses = ["SUBMITTED", "CONFIRMED", "ARE_APPROVED"];
+
+    if (!amendableStatuses.includes(String(sourceReport.status))) {
       return res.status(409).json({
-        message: "Only SUBMITTED reports can be amended.",
+        message:
+          "Only SUBMITTED, CONFIRMED, or ARE_APPROVED reports with a pending change request can be amended.",
       });
     }
 
