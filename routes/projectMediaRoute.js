@@ -144,15 +144,35 @@ async function canEditOrDeleteMedia(user, mediaRow) {
 
   if (role === "admin") return true;
 
-  if (String(mediaRow.uploaded_by || "") !== String(user.id)) {
-    return false;
+  // General project media: only the uploader can edit/delete.
+  if (!mediaRow.report_id) {
+    return String(mediaRow.uploaded_by || "") === String(user.id);
   }
-
-  if (!mediaRow.report_id) return true;
 
   const report = await getReport(mediaRow.report_id);
 
-  return report && String(report.status) === "DRAFT";
+  if (!report) return false;
+
+  const status = String(report.status || "").toUpperCase();
+
+  // Once R.E has made final approval, photos/videos are sealed.
+  if (status === "RE_APPROVED") {
+    return false;
+  }
+
+  const assignment = await getWorkflowAssignment(report.project_id);
+
+  const isAssignedSiteAgent =
+    String(assignment?.siteagent_id || "") === String(user.id);
+
+  const isReportCreator =
+    String(report.created_by || "") === String(user.id);
+
+  const isUploader =
+    String(mediaRow.uploaded_by || "") === String(user.id);
+
+  // Site Agent may delete daily report media before final R.E approval.
+  return role === "siteagent" && (isAssignedSiteAgent || isReportCreator || isUploader);
 }
 
 async function canSelectForReport(user, mediaRow) {
