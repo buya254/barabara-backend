@@ -854,6 +854,14 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
         : n.toFixed(2).replace(/\.00$/, "");
     };
 
+    const formatHumanCount = (value) => {
+      const n = Number(value || 0);
+
+      if (!Number.isFinite(n)) return "0";
+
+      return String(Math.round(n));
+    };
+
     const summaryRows = makeEmptyLabourSummaryRows().map((row) => ({
       ...row,
 
@@ -969,20 +977,20 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
       const isGeneralLabourers = row.no === GENERAL_LABOURERS_ROW_NO;
 
       const mobilizedDisplay = isGeneralLabourers
-        ? `${formatSummaryNumber(mobilized)}(${row.frequency || 0})`
-        : formatSummaryNumber(mobilized);
+        ? `${formatHumanCount(mobilized)} (${row.frequency || 0})`
+        : formatHumanCount(mobilized);
 
       const finalRow = {
         no: row.no,
         personnel: row.personnel,
         requiredNo: Number(Number(row.requiredNo || 0).toFixed(2)),
-        mobilized: Number(mobilized.toFixed(2)),
+        mobilized: Math.round(mobilized),
         mobilizedDisplay,
         frequency: isGeneralLabourers ? Number(row.frequency || 0) : null,
-        balance: Number(balance.toFixed(2)),
-        male: Number(Number(row.male || 0).toFixed(2)),
-        female: Number(Number(row.female || 0).toFixed(2)),
-        plwds: Number(Number(row.plwds || 0).toFixed(2)),
+        balance: Math.round(balance),
+        male: Math.round(Number(row.male || 0)),
+        female: Math.round(Number(row.female || 0)),
+        plwds: Math.round(Number(row.plwds || 0)),
         malePercent: calculateLabourPercent(row.male, mobilized),
         femalePercent: calculateLabourPercent(row.female, mobilized),
         plwdsPercent: calculateLabourPercent(row.plwds, mobilized),
@@ -1040,7 +1048,7 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
       totals: {
         requiredNo: Number(requiredTotal.toFixed(2)),
         mobilized: Number(mobilizedTotal.toFixed(2)),
-        balance: Number(totalsBalance.toFixed(2)),
+        balance: Number(Math.abs(requiredTotal - mobilizedTotal).toFixed(2)),
         male: Number(maleTotal.toFixed(2)),
         female: Number(femaleTotal.toFixed(2)),
         plwds: Number(plwdsTotal.toFixed(2)),
@@ -1048,7 +1056,7 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
         femalePercent: calculateLabourPercent(femaleTotal, mobilizedTotal),
         plwdsPercent: calculateLabourPercent(plwdsTotal, mobilizedTotal),
         casualLabourers: Number(casualTotal.toFixed(2)),
-        casualLabourersDisplay: `${formatSummaryNumber(casualTotal)}(${
+        casualLabourersDisplay: `${formatHumanCount(casualTotal)} (${
           generalRow.frequency || 0
         })`,
         skilledLabourers: Number(skilledTotal.toFixed(2)),
