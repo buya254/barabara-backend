@@ -740,9 +740,13 @@ router.get("/plant-equipment-summary", authenticateJWT, async (req, res) => {
  * LABOUR RETURNS SUMMARY
  * GET /api/daily-work-reports/labour-returns-summary?project_id=&from_date=&to_date=
  *
- * Reads submitted/approved daily work reports and aggregates labourReturnRows.
- * Cumulative logic is person-days:
- * same driver present for 7 days = 7 driver entries.
+ * Monthly Labour Return logic:
+ * - Required No. = latest saved Required No. per personnel row.
+ * - Most personnel rows = highest daily mobilized number in the period.
+ * - Students behave like most personnel rows.
+ * - General Labourers = average daily mobilized count.
+ * - General Labourers display = average(frequency), e.g. 18(3).
+ * - Balance = ABS(Required No. - Mobilized).
  */
 router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
   try {
@@ -838,13 +842,43 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
       [resolvedProjectId, from_date, to_date]
     );
 
-    const summaryRows = makeEmptyLabourSummaryRows();
+    const GENERAL_LABOURERS_ROW_NO = 41;
+
+    const formatSummaryNumber = (value) => {
+      const n = Number(value || 0);
+
+      if (!Number.isFinite(n)) return "0";
+
+      return Number.isInteger(n)
+        ? String(n)
+        : n.toFixed(2).replace(/\.00$/, "");
+    };
+
+    const summaryRows = makeEmptyLabourSummaryRows().map((row) => ({
+      ...row,
+
+      // Used for normal rows: keep the highest daily mobilized value.
+      maxMobilized: 0,
+
+      // Used only for General Labourers average.
+      generalMobilizedSum: 0,
+      generalMaleSum: 0,
+      generalFemaleSum: 0,
+      generalPlwdsSum: 0,
+      generalFrequencyDays: new Set(),
+
+      calculationMethod:
+        row.no === GENERAL_LABOURERS_ROW_NO ? "AVERAGE" : "MAX",
+    }));
 
     reportRows.forEach((report) => {
       const formJson = parseFormJsonFromDb(report.form_json);
       const labourReturnRows = Array.isArray(formJson.labourReturnRows)
         ? formJson.labourReturnRows
         : [];
+
+      const reportDateKey =
+        String(report.report_date || "").slice(0, 10) || String(report.id);
 
       labourReturnRows.forEach((row) => {
         const rowNo = Number(row.no);
@@ -860,17 +894,65 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
           target.personnel = cleanText(row.personnel);
         }
 
-        const requiredNo = toNumber(row.requiredNo);
+        // Required No. is not cumulative.
+        // Use the latest non-blank saved Required No.
+        if (cleanText(row.requiredNo) !== "") {
+          target.requiredNo = toNumber(row.requiredNo);
+        }
+
         const male = toNumber(row.male);
         const female = toNumber(row.female);
         const plwds = toNumber(row.plwds);
+        const mobilized = male + female;
 
-        target.requiredNo += requiredNo;
-        target.male += male;
-        target.female += female;
-        target.plwds += plwds;
+        if (rowNo === GENERAL_LABOURERS_ROW_NO) {
+          const hasCapturedGeneralLabourers =
+            cleanText(row.male) !== "" ||
+            cleanText(row.female) !== "" ||
+            cleanText(row.plwds) !== "" ||
+            mobilized > 0;
+
+          if (hasCapturedGeneralLabourers) {
+            target.generalMobilizedSum += mobilized;
+            target.generalMaleSum += male;
+            target.generalFemaleSum += female;
+            target.generalPlwdsSum += plwds;
+            target.generalFrequencyDays.add(reportDateKey);
+          }
+
+          return;
+        }
+
+        // Most personnel rows:
+        // Use the highest mobilized number recorded in the selected period.
+        // If same mobilized count appears later, keep the later gender split.
+        if (mobilized >= target.maxMobilized) {
+          target.maxMobilized = mobilized;
+          target.mobilized = mobilized;
+          target.male = male;
+          target.female = female;
+          target.plwds = plwds;
+        }
       });
     });
+
+    // Finalize General Labourers average.
+    const generalRow = summaryRows[GENERAL_LABOURERS_ROW_NO - 1];
+    const generalFrequency = generalRow.generalFrequencyDays.size;
+
+    if (generalFrequency > 0) {
+      generalRow.mobilized = generalRow.generalMobilizedSum / generalFrequency;
+      generalRow.male = generalRow.generalMaleSum / generalFrequency;
+      generalRow.female = generalRow.generalFemaleSum / generalFrequency;
+      generalRow.plwds = generalRow.generalPlwdsSum / generalFrequency;
+      generalRow.frequency = generalFrequency;
+    } else {
+      generalRow.mobilized = 0;
+      generalRow.male = 0;
+      generalRow.female = 0;
+      generalRow.plwds = 0;
+      generalRow.frequency = 0;
+    }
 
     let requiredTotal = 0;
     let mobilizedTotal = 0;
@@ -881,38 +963,51 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
     let skilledTotal = 0;
 
     const finalizedRows = summaryRows.map((row) => {
-      const mobilized = row.male + row.female;
-      const balance = row.requiredNo - mobilized;
+      const mobilized = Number(row.mobilized || 0);
+      const balance = Math.abs(Number(row.requiredNo || 0) - mobilized);
+
+      const isGeneralLabourers = row.no === GENERAL_LABOURERS_ROW_NO;
+
+      const mobilizedDisplay = isGeneralLabourers
+        ? `${formatSummaryNumber(mobilized)}(${row.frequency || 0})`
+        : formatSummaryNumber(mobilized);
 
       const finalRow = {
         no: row.no,
         personnel: row.personnel,
-        requiredNo: Number(row.requiredNo.toFixed(2)),
+        requiredNo: Number(Number(row.requiredNo || 0).toFixed(2)),
         mobilized: Number(mobilized.toFixed(2)),
+        mobilizedDisplay,
+        frequency: isGeneralLabourers ? Number(row.frequency || 0) : null,
         balance: Number(balance.toFixed(2)),
-        male: Number(row.male.toFixed(2)),
-        female: Number(row.female.toFixed(2)),
-        plwds: Number(row.plwds.toFixed(2)),
+        male: Number(Number(row.male || 0).toFixed(2)),
+        female: Number(Number(row.female || 0).toFixed(2)),
+        plwds: Number(Number(row.plwds || 0).toFixed(2)),
         malePercent: calculateLabourPercent(row.male, mobilized),
         femalePercent: calculateLabourPercent(row.female, mobilized),
         plwdsPercent: calculateLabourPercent(row.plwds, mobilized),
+        calculationMethod: row.calculationMethod,
       };
 
-      requiredTotal += row.requiredNo;
-      mobilizedTotal += mobilized;
-      maleTotal += row.male;
-      femaleTotal += row.female;
-      plwdsTotal += row.plwds;
+      requiredTotal += finalRow.requiredNo;
+      mobilizedTotal += finalRow.mobilized;
+      maleTotal += finalRow.male;
+      femaleTotal += finalRow.female;
+      plwdsTotal += finalRow.plwds;
 
-      // Row 41 General Labourers + Row 47 Students = casual labourers.
-      if (row.no === 41 || row.no === 47) {
-        casualTotal += mobilized;
+      // Monthly rule:
+      // General Labourers are the casual labourers.
+      // Students are treated like the other rows.
+      if (row.no === GENERAL_LABOURERS_ROW_NO) {
+        casualTotal += finalRow.mobilized;
       } else {
-        skilledTotal += mobilized;
+        skilledTotal += finalRow.mobilized;
       }
 
       return finalRow;
     });
+
+    const totalsBalance = Math.abs(requiredTotal - mobilizedTotal);
 
     return res.json({
       project: project
@@ -945,7 +1040,7 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
       totals: {
         requiredNo: Number(requiredTotal.toFixed(2)),
         mobilized: Number(mobilizedTotal.toFixed(2)),
-        balance: Number((requiredTotal - mobilizedTotal).toFixed(2)),
+        balance: Number(totalsBalance.toFixed(2)),
         male: Number(maleTotal.toFixed(2)),
         female: Number(femaleTotal.toFixed(2)),
         plwds: Number(plwdsTotal.toFixed(2)),
@@ -953,6 +1048,9 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
         femalePercent: calculateLabourPercent(femaleTotal, mobilizedTotal),
         plwdsPercent: calculateLabourPercent(plwdsTotal, mobilizedTotal),
         casualLabourers: Number(casualTotal.toFixed(2)),
+        casualLabourersDisplay: `${formatSummaryNumber(casualTotal)}(${
+          generalRow.frequency || 0
+        })`,
         skilledLabourers: Number(skilledTotal.toFixed(2)),
       },
 
