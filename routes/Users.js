@@ -11,7 +11,14 @@ const excludedUsernames = ["phabade", "bmagenyi"];
 // One place to define default password (or override via .env)
 const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || "Kura1234";
 
-/** GET all users with optional filters, including read-only assigned projects */
+function cleanOptionalText(value) {
+  if (value === undefined || value === null) return null;
+
+  const trimmed = String(value).trim();
+
+  return trimmed ? trimmed : null;
+}
+
 /** GET all users with optional filters, including read-only assigned projects */
 router.get("/users", async (req, res) => {
   try {
@@ -364,6 +371,126 @@ router.put("/users/reset_password/:id", async (req, res) => {
   } catch (err) {
     console.error("Failed to reset password:", err);
     res.status(500).json({ message: "Server error" });
+  }
+});
+
+/**
+ * GET current user's first-login profile confirmation data
+ * GET /api/users/me/profile-check
+ */
+router.get("/users/me/profile-check", authenticateJWT, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `
+      SELECT
+        id,
+        username,
+        full_name,
+        role,
+        region,
+        email,
+        financial_year,
+        phone,
+        signature,
+        must_change_password,
+        profile_confirmed,
+        profile_confirmed_at
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [req.user.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    const user = rows[0];
+
+    return res.json({
+      id: user.id,
+      username: user.username,
+      full_name: user.full_name || "",
+      role: user.role || "",
+      region: user.region || "",
+      email: user.email || "",
+      financial_year: user.financial_year || "",
+      phone: user.phone || "",
+
+      signature: user.signature || null,
+      has_signature: Boolean(user.signature),
+      signature_preview_url: user.signature || null,
+
+      must_change_password: Number(user.must_change_password || 0),
+      profile_confirmed: Number(user.profile_confirmed || 0),
+      profile_confirmed_at: user.profile_confirmed_at || null,
+
+      needs_profile_confirmation: Number(user.profile_confirmed || 0) !== 1,
+    });
+  } catch (err) {
+    console.error("❌ profile-check error:", err);
+    return res.status(500).json({
+      message: "Failed to load profile confirmation data.",
+    });
+  }
+});
+
+/**
+ * Confirm current user's profile details after password change
+ * PUT /api/users/me/confirm-profile
+ * body: { email?, phone? }
+ */
+router.put("/users/me/confirm-profile", authenticateJWT, async (req, res) => {
+  try {
+    const email = cleanOptionalText(req.body?.email);
+    const phone = cleanOptionalText(req.body?.phone);
+
+    await db.query(
+      `
+      UPDATE users
+      SET
+        email = COALESCE(?, email),
+        phone = COALESCE(?, phone),
+        profile_confirmed = 1,
+        profile_confirmed_at = NOW()
+      WHERE id = ?
+      `,
+      [email, phone, req.user.id]
+    );
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        id,
+        username,
+        full_name,
+        role,
+        region,
+        email,
+        financial_year,
+        phone,
+        signature,
+        profile_confirmed,
+        profile_confirmed_at
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [req.user.id]
+    );
+
+    return res.json({
+      message: "Profile confirmed successfully.",
+      user: rows[0] || null,
+    });
+  } catch (err) {
+    console.error("❌ confirm-profile error:", err);
+    return res.status(500).json({
+      message: "Failed to confirm profile.",
+    });
   }
 });
 

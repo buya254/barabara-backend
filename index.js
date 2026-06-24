@@ -14,6 +14,7 @@ const app = express();
 const importUsersRoutes =require("./routes/importUsers");
 const authRoute = require("./routes/authRoute");
 const dailyWorkReports = require("./routes/dailyWorkReports");
+const signatureRoutes = require("./routes/signatureRoutes");
 const projectAccessRoute = require("./routes/projectAccess");
 const projectsRouter = require("./routes/projects");
 const importProjectsRoutes = require("./routes/importProjectsRoutes");
@@ -37,7 +38,14 @@ app.use(cors({
 
 // Body Parsers
 app.use(express.json());
+
+app.use(
+  "/uploads",
+  express.static(path.join(__dirname, "uploads"))
+);
+
 app.use(express.urlencoded({ extended: true }));
+
 
 // Session Middleware
 app.use(session({
@@ -67,6 +75,7 @@ app.use("/api", userRoutes);
 app.use("/api/import-users", importUsersRoutes);
 app.use("/api/auth", authRoute);
 app.use("/api/daily-work-reports", dailyWorkReports);
+app.use("/api/signatures", signatureRoutes);
 app.use("/api/project-access", projectAccessRoute);
 app.use("/api/projects", projectsRouter);
 app.use("/api/import-projects", importProjectsRoutes);
