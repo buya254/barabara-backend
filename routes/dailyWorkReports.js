@@ -563,26 +563,45 @@ router.get("/plant-equipment-summary", authenticateJWT, async (req, res) => {
       });
     }
 
-    const [projectRows] = await db.query(
-      `
-      SELECT
-        p.id,
-        p.project_number,
-        p.project_name,
-        p.name,
-        p.contractor,
-        p.region,
-        c.id AS contract_id,
-        c.contract_name
-      FROM projects p
-      LEFT JOIN contracts c
-        ON c.project_id = p.id
-      WHERE p.id = ?
-      ORDER BY c.id DESC
-      LIMIT 1
-      `,
-      [resolvedProjectId]
-    );
+ const [projectRows] = await db.query(
+  `
+  SELECT
+    p.id,
+    p.project_number,
+    p.project_name,
+    p.name,
+    p.contractor,
+    p.region,
+
+    c.id AS contract_id,
+    c.contract_name,
+
+    sa.full_name AS siteagent_full_name,
+    sa.signature AS siteagent_signature,
+
+    reu.full_name AS re_full_name,
+    reu.signature AS re_signature
+
+  FROM projects p
+
+  LEFT JOIN contracts c
+    ON c.project_id = p.id
+
+  LEFT JOIN project_workflow_assignments pwa
+    ON pwa.project_id = p.id
+
+  LEFT JOIN users sa
+    ON sa.id = pwa.siteagent_id
+
+  LEFT JOIN users reu
+    ON reu.id = pwa.re_id
+
+  WHERE p.id = ?
+  ORDER BY c.id DESC
+  LIMIT 1
+  `,
+  [resolvedProjectId]
+);
 
     const project = projectRows[0] || null;
 
@@ -711,11 +730,20 @@ router.get("/plant-equipment-summary", authenticateJWT, async (req, res) => {
             region: project.region || "",
             contract_id: project.contract_id || null,
             contract_no: project.contract_name || project.project_number || "",
+
+            siteagent_full_name: project.siteagent_full_name || "",
+            siteagent_signature: project.siteagent_signature || "",
+
+            re_full_name: project.re_full_name || "",
+            re_signature: project.re_signature || "",
           }
         : {
             id: resolvedProjectId,
+            siteagent_full_name: "",
+            siteagent_signature: "",
+            re_full_name: "",
+            re_signature: "",
           },
-
       period: {
         from_date,
         to_date,
