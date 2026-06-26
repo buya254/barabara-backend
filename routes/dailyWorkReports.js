@@ -823,43 +823,59 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
     }
 
    const [projectRows] = await db.query(
-  `
-  SELECT
-    p.id,
-    p.project_number,
-    p.project_name,
-    p.name,
-    p.contractor,
-    p.region,
+      `
+      SELECT
+        p.id,
+        p.project_number,
+        p.project_name,
+        p.name,
+        p.region,
+        p.financial_year,
+        p.contractor,
+        p.chainage,
+        p.project_duration,
 
-    c.id AS contract_id,
-    c.contract_name,
+        c.id AS contract_id,
+        c.contract_name,
+        c.financial_year AS contract_financial_year,
 
-    sa.full_name AS siteagent_full_name,
-    sa.signature AS siteagent_signature,
+        sa.full_name AS siteagent_full_name,
+        sa.signature AS siteagent_signature,
 
-    reu.full_name AS re_full_name,
-    reu.signature AS re_signature
+        ins.full_name AS inspector_full_name,
+        ins.signature AS inspector_signature,
 
-  FROM projects p
-  LEFT JOIN contracts c
-    ON c.project_id = p.id
+        areu.full_name AS are_full_name,
+        areu.signature AS are_signature,
 
-  LEFT JOIN project_workflow_assignments pwa
-    ON pwa.project_id = p.id
+        reu.full_name AS re_full_name,
+        reu.signature AS re_signature
 
-  LEFT JOIN users sa
-    ON sa.id = pwa.siteagent_id
+      FROM projects p
+      LEFT JOIN contracts c
+        ON c.project_id = p.id
 
-  LEFT JOIN users reu
-    ON reu.id = pwa.re_id
+      LEFT JOIN project_workflow_assignments pwa
+        ON pwa.project_id = p.id
 
-  WHERE p.id = ?
-  ORDER BY c.id DESC
-  LIMIT 1
-  `,
-  [resolvedProjectId]
-);
+      LEFT JOIN users sa
+        ON sa.id = pwa.siteagent_id
+
+      LEFT JOIN users ins
+        ON ins.id = pwa.inspector_id
+
+      LEFT JOIN users areu
+        ON areu.id = pwa.are_id
+
+      LEFT JOIN users reu
+        ON reu.id = pwa.re_id
+
+      WHERE p.id = ?
+      ORDER BY c.id DESC
+      LIMIT 1
+      `,
+      [resolvedProjectId]
+    );
 
     const project = projectRows[0] || null;
 
@@ -1292,6 +1308,61 @@ router.get("/:id", authenticateJWT, async (req, res) => {
     const isWorkflowAssigned = isAssignedToProject(req.user, assignment);
     const isCreator = String(report.created_by || "") === uid;
 
+    const [projectRows] = await db.query(
+      `
+      SELECT
+        p.id,
+        p.project_number,
+        p.project_name,
+        p.name,
+        p.region,
+        p.financial_year,
+        p.contractor,
+        p.chainage,
+        p.project_duration,
+
+        c.id AS contract_id,
+        c.contract_name,
+        c.financial_year AS contract_financial_year,
+
+        sa.full_name AS siteagent_full_name,
+        sa.signature AS siteagent_signature,
+
+        ins.full_name AS inspector_full_name,
+        ins.signature AS inspector_signature,
+
+        areu.full_name AS are_full_name,
+        areu.signature AS are_signature,
+
+        reu.full_name AS re_full_name,
+        reu.signature AS re_signature
+
+      FROM projects p
+      LEFT JOIN contracts c
+        ON c.project_id = p.id
+
+      LEFT JOIN project_workflow_assignments pwa
+        ON pwa.project_id = p.id
+
+      LEFT JOIN users sa
+        ON sa.id = pwa.siteagent_id
+
+      LEFT JOIN users ins
+        ON ins.id = pwa.inspector_id
+
+      LEFT JOIN users areu
+        ON areu.id = pwa.are_id
+
+      LEFT JOIN users reu
+        ON reu.id = pwa.re_id
+
+      WHERE p.id = ?
+      ORDER BY c.id DESC
+      LIMIT 1
+      `,
+      [report.project_id]
+    );
+
     const [userProjectRows] = await db.query(
       `
       SELECT 1
@@ -1315,33 +1386,39 @@ router.get("/:id", authenticateJWT, async (req, res) => {
     const withParsed = await getReportWithParsed(report.id);
     const lastAction = await getLastAction(report.id);
 
-    const [projectRows] = await db.query(
+    const project = projectRows[0] || null;
+
+    const [signatureDateRows] = await db.query(
       `
       SELECT
-        p.id,
-        p.project_number,
-        p.project_name,
-        p.name,
-        p.region,
-        p.financial_year,
-        p.contractor,
-        p.chainage,
-        p.project_duration,
+        MAX(
+          CASE
+            WHEN action_type IN ('SUBMITTED', 'AMENDED_RESUBMITTED')
+            THEN created_at
+          END
+        ) AS siteagent_signed_at,
 
-        c.id AS contract_id,
-        c.contract_name,
-        c.financial_year AS contract_financial_year
-      FROM projects p
-      LEFT JOIN contracts c
-        ON c.project_id = p.id
-      WHERE p.id = ?
-      ORDER BY c.id DESC
-      LIMIT 1
+        MAX(
+          CASE
+            WHEN action_type = 'INSPECTOR_APPROVED'
+            THEN created_at
+          END
+        ) AS inspector_signed_at,
+
+        MAX(
+          CASE
+            WHEN action_type = 'RE_APPROVED'
+            THEN created_at
+          END
+        ) AS are_signed_at
+
+      FROM daily_work_reports_actions
+      WHERE report_id = ?
       `,
-      [report.project_id]
+      [report.id]
     );
 
-    const project = projectRows[0] || null;
+    const signatureDates = signatureDateRows[0] || {};
 
     return res.json({
       ...withParsed,
@@ -1371,6 +1448,38 @@ router.get("/:id", authenticateJWT, async (req, res) => {
               project.contract_financial_year || project.financial_year,
           }
         : null,
+
+      signers: project
+        ? {
+            inspector: {
+              full_name: project.inspector_full_name || "",
+              signature: project.inspector_signature || "",
+            },
+            siteAgent: {
+              full_name: project.siteagent_full_name || "",
+              signature: project.siteagent_signature || "",
+            },
+            are: {
+              full_name: project.are_full_name || "",
+              signature: project.are_signature || "",
+            },
+            re: {
+              full_name: project.re_full_name || "",
+              signature: project.re_signature || "",
+            },
+          }
+        : {
+            inspector: { full_name: "", signature: "" },
+            siteAgent: { full_name: "", signature: "" },
+            are: { full_name: "", signature: "" },
+            re: { full_name: "", signature: "" },
+          },
+
+      signatureDates: {
+        siteAgent: signatureDates.siteagent_signed_at || report.submitted_at || null,
+        inspector: signatureDates.inspector_signed_at || report.confirmed_at || null,
+        are: signatureDates.are_signed_at || report.re_approved_at || null,
+      },
 
       tracking: {
         ...statusTracker(report),
