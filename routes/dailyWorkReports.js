@@ -116,32 +116,26 @@ const statusTracker = (report) => {
   const changeRequested = Number(report.change_requested || 0) === 1;
 
   if (changeRequested) {
-    const changeMap = {
-      SUBMITTED: {
-        stage: 2,
-        label: "Change Requested",
-        nextRole: "siteagent",
-        nextAction: "Amend and resubmit",
-        waitingFor: "Site Agent to amend and resubmit",
-      },
-      CONFIRMED: {
-        stage: 3,
-        label: "Change Requested",
-        nextRole: "inspector",
-        nextAction: "Review requested change",
-        waitingFor: "Inspector to review requested changes",
-      },
-      ARE_APPROVED: {
-        stage: 4,
-        label: "Change Requested",
-        nextRole: "are",
-        nextAction: "Review requested change",
-        waitingFor: "A.R.E to review requested changes",
-      },
-    };
+  const changeMap = {
+    DRAFT: {
+      stage: 1,
+      label: "Draft (Requested change)",
+      nextRole: "siteagent",
+      nextAction: "Amend and resubmit",
+      waitingFor: "Site Agent to amend and resubmit",
+    },
+  };
 
-    if (changeMap[s]) return changeMap[s];
-  }
+  if (changeMap[s]) return changeMap[s];
+
+  return {
+    stage: 1,
+    label: "Change Requested",
+    nextRole: "siteagent",
+    nextAction: "Return to Site Agent draft",
+    waitingFor: "System/admin to convert this requested change to draft",
+  };
+}
 
   const map = {
     DRAFT: {
@@ -1393,7 +1387,7 @@ router.get("/:id", authenticateJWT, async (req, res) => {
       SELECT
         MAX(
           CASE
-            WHEN action_type IN ('SUBMITTED', 'AMENDED_RESUBMITTED')
+            WHEN action_type IN ('SUBMITTED', 'AMENDED_RESUBMITTED', 'CHANGE_RESUBMITTED')
             THEN created_at
           END
         ) AS siteagent_signed_at,
@@ -1849,8 +1843,23 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
     if (!report) return res.status(404).json({ message: "Report not found" });
 
     const isDraft = String(report.status) === "DRAFT";
+    const isRequestedChangeDraft =
+      isDraft && Number(report.change_requested || 0) === 1;
+
     const isAmendmentDraft =
       isDraft && Number(report.amendment_of_report_id || 0) > 0;
+
+    const submitActionType = isRequestedChangeDraft
+      ? "CHANGE_RESUBMITTED"
+      : isAmendmentDraft
+      ? "AMENDED_RESUBMITTED"
+      : "SUBMITTED";
+
+    const submitMessage = isRequestedChangeDraft
+      ? "Change resubmitted to Inspector"
+      : isAmendmentDraft
+      ? "Amendment resubmitted to Inspector"
+      : "Submitted to Inspector";
 
     if (!isDraft) {
       return res.status(409).json({
@@ -1886,7 +1895,7 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
 
     await logDwrAction({
       reportId: report.id,
-      actionType: isAmendmentDraft ? "AMENDED_RESUBMITTED" : "SUBMITTED",
+      actionType: submitActionType,
       userId: req.user.id,
       userRole: req.user.role,
       notes: req.body?.notes || null,
@@ -1916,9 +1925,7 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
     const updated = await getReportWithParsed(report.id);
 
     return res.json({
-      message: isAmendmentDraft
-        ? "Amendment resubmitted to Inspector"
-        : "Submitted to Inspector",
+      message: submitMessage,
       report: updated,
     });
   } catch (err) {
@@ -1984,37 +1991,36 @@ router.put("/:id/confirm", authenticateJWT, async (req, res) => {
 });
 
 /**
+ /**
  * REQUEST CHANGE
- * Inspector: SUBMITTED -> stays SUBMITTED, change_requested = 1
- * ARE: CONFIRMED -> stays CONFIRMED, change_requested = 1
- * RE: ARE_APPROVED -> stays ARE_APPROVED, change_requested = 1
- * PUT /api/daily-work-reports/:id/request-change
- * body: { notes }
+ * Inspector: SUBMITTED -> DRAFT, change_requested = 1
+ * ARE: CONFIRMED -> DRAFT, change_requested = 1
+ * RE: ARE_APPROVED -> DRAFT, change_requested = 1
  */
 router.put("/:id/request-change", authenticateJWT, async (req, res) => {
   try {
     const userRole = String(req.user.role || "").toLowerCase();
 
     const rules = {
-      inspector: {
-        expectedStatus: "SUBMITTED",
-        assignmentColumn: "inspector_id",
-        actionType: "INSPECTOR_REQUESTED_CHANGE",
-        targetRole: "Site Agent",
-      },
-      are: {
-        expectedStatus: "CONFIRMED",
-        assignmentColumn: "are_id",
-        actionType: "ARE_REQUESTED_CHANGE",
-        targetRole: "Inspector",
-      },
-      re: {
-        expectedStatus: "ARE_APPROVED",
-        assignmentColumn: "re_id",
-        actionType: "RE_REQUESTED_CHANGE",
-        targetRole: "A.R.E",
-      },
-    };
+  inspector: {
+    expectedStatus: "SUBMITTED",
+    assignmentColumn: "inspector_id",
+    actionType: "INSPECTOR_REQUESTED_CHANGE",
+    targetRole: "Site Agent",
+  },
+  are: {
+    expectedStatus: "CONFIRMED",
+    assignmentColumn: "are_id",
+    actionType: "ARE_REQUESTED_CHANGE",
+    targetRole: "Site Agent",
+  },
+  re: {
+    expectedStatus: "ARE_APPROVED",
+    assignmentColumn: "re_id",
+    actionType: "RE_REQUESTED_CHANGE",
+    targetRole: "Site Agent",
+  },
+};
 
     const rule = rules[userRole];
 
@@ -2062,11 +2068,15 @@ router.put("/:id/request-change", authenticateJWT, async (req, res) => {
     await db.query(
       `
       UPDATE daily_work_reports
-      SET change_requested = 1,
+      SET status = 'DRAFT',
+          change_requested = 1,
           change_request_notes = ?,
           change_requested_by = ?,
           change_requested_role = ?,
-          change_requested_at = ?
+          change_requested_at = ?,
+          confirmed_at = NULL,
+          are_approved_at = NULL,
+          re_approved_at = NULL
       WHERE id = ?
       `,
       [
@@ -2089,7 +2099,7 @@ router.put("/:id/request-change", authenticateJWT, async (req, res) => {
     const updated = await getReportWithParsed(report.id);
 
     return res.json({
-      message: `Change requested. Report sent back to ${rule.targetRole} with notes.`,
+      message: "Change requested. Report returned to Site Agent draft with notes.",
       report: updated,
     });
   } catch (err) {
