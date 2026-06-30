@@ -700,6 +700,41 @@ async function saveOtherItemsForReport(reportId, userId) {
     console.warn("⚠️ Could not save other items for report:", reportId, err);
   }
 }
+
+function normalizeRequiredNoForDb(value) {
+  const raw = String(value ?? "").trim();
+
+  if (!raw) return null;
+
+  const n = Number(raw.replace(",", "."));
+
+  if (!Number.isFinite(n)) return null;
+
+  return n;
+}
+
+async function canAccessProjectForDailyReports(user, projectId) {
+  const userRole = String(user.role || "").toLowerCase();
+  const assignment = await getAssignment(projectId);
+
+  const [userProjectRows] = await db.query(
+    `
+    SELECT 1
+    FROM user_projects
+    WHERE user_id = ?
+      AND project_id = ?
+    LIMIT 1
+    `,
+    [user.id, projectId]
+  );
+
+  return (
+    userRole === "admin" ||
+    isAssignedToProject(user, assignment) ||
+    userProjectRows.length > 0
+  );
+}
+
 // ---------------- ROUTES ----------------
 
 /**
@@ -1388,6 +1423,117 @@ router.get("/labour-returns-summary", authenticateJWT, async (req, res) => {
     });
   } catch (err) {
     console.error("❌ labour-returns-summary error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/**
+ * PROJECT LABOUR REQUIREMENTS
+ * GET /api/daily-work-reports/labour-requirements/:projectId
+ */
+router.get("/labour-requirements/:projectId", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = Number(req.params.projectId);
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Invalid project id." });
+    }
+
+    const allowed = await canAccessProjectForDailyReports(req.user, projectId);
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "You are not allowed to view labour requirements for this project.",
+      });
+    }
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        row_no AS no,
+        personnel,
+        required_no AS requiredNo
+      FROM project_labour_requirements
+      WHERE project_id = ?
+      ORDER BY row_no ASC
+      `,
+      [projectId]
+    );
+
+    return res.json({ rows });
+  } catch (err) {
+    console.error("❌ labour requirements get error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/**
+ * PROJECT LABOUR REQUIREMENTS
+ * PUT /api/daily-work-reports/labour-requirements/:projectId
+ */
+router.put("/labour-requirements/:projectId", authenticateJWT, async (req, res) => {
+  try {
+    const projectId = Number(req.params.projectId);
+
+    if (!Number.isInteger(projectId) || projectId <= 0) {
+      return res.status(400).json({ message: "Invalid project id." });
+    }
+
+    const userRole = String(req.user.role || "").toLowerCase();
+    const assignment = await getAssignment(projectId);
+
+    const allowed =
+      userRole === "admin" ||
+      (assignment && String(assignment.siteagent_id) === String(req.user.id));
+
+    if (!allowed) {
+      return res.status(403).json({
+        message: "Only the assigned Site Agent can update labour requirements.",
+      });
+    }
+
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+
+    for (const row of rows) {
+      const rowNo = Number(row.no);
+
+      if (!Number.isInteger(rowNo) || rowNo < 1 || rowNo > 50) {
+        continue;
+      }
+
+      const personnel = cleanText(row.personnel);
+      const requiredNo = normalizeRequiredNoForDb(row.requiredNo);
+
+      if (!personnel) {
+        continue;
+      }
+
+      await db.query(
+        `
+        INSERT INTO project_labour_requirements
+          (
+            project_id,
+            row_no,
+            personnel,
+            required_no,
+            updated_by
+          )
+        VALUES (?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          personnel = VALUES(personnel),
+          required_no = VALUES(required_no),
+          updated_by = VALUES(updated_by),
+          updated_at = CURRENT_TIMESTAMP
+        `,
+        [projectId, rowNo, personnel, requiredNo, req.user.id]
+      );
+    }
+
+    return res.json({
+      message: "Project labour requirements saved.",
+    });
+  } catch (err) {
+    console.error("❌ labour requirements save error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });

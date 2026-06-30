@@ -6,6 +6,7 @@ const authenticateJWT = require("../middlewares/auth");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 
 // uploads/project-media
 const uploadDir = path.join(__dirname, "..", "uploads", "project-media");
@@ -43,6 +44,21 @@ function getFileType(mimeType) {
   if (String(mimeType || "").startsWith("image/")) return "image";
   if (String(mimeType || "").startsWith("video/")) return "video";
   return null;
+}
+
+function getFileSha256(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function safeUnlink(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (err) {
+    console.warn("Could not delete uploaded file:", filePath, err.message);
+  }
 }
 
 async function getReport(reportId) {
@@ -346,26 +362,68 @@ router.post("/upload", authenticateJWT, upload.single("file"), async (req, res) 
     }
 
     if (fileType === "video") {
-      const [videoCountRows] = await db.query(
-        `
-        SELECT COUNT(*) AS total
-        FROM project_media
-        WHERE project_id = ?
-          AND file_type = 'video'
-          AND deleted_at IS NULL
-        `,
-        [projectId]
-      );
+  const [videoCountRows] = await db.query(
+    `
+    SELECT COUNT(*) AS total
+    FROM project_media
+    WHERE project_id = ?
+      AND file_type = 'video'
+      AND deleted_at IS NULL
+    `,
+    [projectId]
+  );
 
-      if (Number(videoCountRows[0]?.total || 0) >= 10) {
-        fs.unlinkSync(file.path);
-        return res.status(400).json({
-          message: "This project already has the maximum 10 videos.",
-        });
-      }
-    }
+  if (Number(videoCountRows[0]?.total || 0) >= 10) {
+    fs.unlinkSync(file.path);
+    return res.status(400).json({
+      message: "This project already has the maximum 10 videos.",
+    });
+  }
+}
 
-    const filePath = `/uploads/project-media/${file.filename}`;
+let fileHash = null;
+
+if (fileType === "image") {
+  fileHash = getFileSha256(file.path);
+
+  const [duplicateRows] = await db.query(
+    `
+    SELECT
+      pm.id,
+      pm.report_id,
+      pm.section,
+      pm.media_context,
+      pm.original_name,
+      pm.file_path,
+      dwr.report_date
+    FROM project_media pm
+    LEFT JOIN daily_work_reports dwr
+      ON dwr.id = pm.report_id
+    WHERE pm.project_id = ?
+      AND pm.file_type = 'image'
+      AND pm.file_hash = ?
+      AND pm.deleted_at IS NULL
+    LIMIT 1
+    `,
+    [projectId, fileHash]
+  );
+
+  if (duplicateRows.length > 0) {
+    const duplicate = duplicateRows[0];
+
+    safeUnlink(file.path);
+
+    return res.status(409).json({
+      message:
+        `This photo has already been uploaded for this project` +
+        `${duplicate.report_date ? ` on ${String(duplicate.report_date).slice(0, 10)}` : ""}` +
+        `${duplicate.section ? ` under ${duplicate.section}` : ""}.`,
+      duplicate,
+    });
+  }
+}
+
+ const filePath = `/uploads/project-media/${file.filename}`;
 
     const [result] = await db.query(
       `
@@ -384,11 +442,12 @@ router.post("/upload", authenticateJWT, upload.single("file"), async (req, res) 
           file_size_bytes,
           duration_seconds,
           caption,
-          uploaded_by
+          uploaded_by,
+          file_hash
         )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
-      [
+     [
         projectId,
         reportId,
         eventId,
@@ -403,6 +462,7 @@ router.post("/upload", authenticateJWT, upload.single("file"), async (req, res) 
         durationSeconds,
         caption,
         req.user.id,
+        fileHash,
       ]
     );
 
