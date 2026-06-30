@@ -62,6 +62,21 @@ async function getReportWithParsed(id) {
 
     return `${year}-${month}-${day}`;
   }
+  function formatDateOnlyForApi(value) {
+  if (!value) return "";
+
+  if (value instanceof Date) {
+    return toDateOnlyString(value);
+  }
+
+  const raw = String(value);
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    return raw.slice(0, 10);
+  }
+
+  return raw;
+}
 
   function getReportDateValidationError(reportDate) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(reportDate || ""))) {
@@ -1456,6 +1471,18 @@ router.get("/", authenticateJWT, async (req, res) => {
 
     const [rows] = await db.query(sql, vals);
 
+    const formattedRows = rows.map((row) => ({
+      ...row,
+      report_date: formatDateOnlyForApi(row.report_date),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      submitted_at: row.submitted_at,
+      confirmed_at: row.confirmed_at,
+      are_approved_at: row.are_approved_at,
+      re_approved_at: row.re_approved_at,
+    }));
+
+
     // Build tracking object, including assigned usernames
     const buildTracking = (r) => {
       const base = statusTracker(r);
@@ -1494,10 +1521,10 @@ router.get("/", authenticateJWT, async (req, res) => {
       };
     };
 
-    const withTracking = rows.map((r) => ({
-      ...r,
-      tracking: buildTracking(r),
-    }));
+    const withTracking = formattedRows.map((r) => ({
+        ...r,
+        tracking: buildTracking(r),
+      }));
 
     const userRole = String(req.user.role).toLowerCase();
 
