@@ -445,6 +445,246 @@ async function getNextUserReportNo(userId) {
 
   return Number(rows?.[0]?.next_no || 1);
 }
+
+const DAILY_PLANT_STANDARD_ITEMS = [
+  "Asphalt Paver",
+  "Asphalt Distributor",
+  "Bitumen Sprayer",
+  "Bitumen Distributor",
+  "Chip Spreader",
+  "Road Roller",
+  "Vibratory Roller",
+  "Pneumatic Tyred Roller",
+  "Single Drum Steel Roller",
+  "Double Drum Steel Roller",
+  "Tandem Roller",
+  "Padfoot Roller",
+  "Motor Grader",
+  "Bulldozer",
+  "Wheel Loader",
+  "Backhoe Loader",
+  "Excavator",
+  "Mini Excavator",
+  "Crawler Excavator",
+  "Skid Steer Loader",
+  "Dump Truck",
+  "Tipper Truck",
+  "Water Bowser/ Tanker",
+  "Hand Roller",
+  "Concrete Mixer 0.1 m³",
+  "Concrete Mixer 0.3 m³",
+  "Concrete Mixer 0.6 m³",
+  "Concrete Pump",
+  "Concrete Vibrator",
+  "Mobile Crane",
+  "Low Loader",
+  "Track Loader",
+  "Track Shovel",
+  "Sheepfoot Roller",
+  "Grid Roller",
+  "Prime Mover",
+  "Compactor",
+  "Plate Compactor",
+  "Rammer Compactor",
+  "Road Marking Machine",
+  "Cold Milling Machine",
+  "Road Sweeper",
+  "Compressor",
+  "Generator",
+  "Welding Machine",
+  "Survey Equipment",
+  "Total Station",
+  "GPS Rover",
+  "Level Machine",
+  "Traffic Control Equipment",
+  "Lighting Tower",
+  "Fuel Bowser",
+  "Tractor",
+  "Tractor with Trailer",
+  "Pulver Mixer",
+  "Rotavator + Tractor",
+  "Pavement Cutter",
+  "Crusher",
+  "Screening Plant",
+  "Batching Plant",
+  "Hot Mix Plant",
+  "Concrete Batching Plant",
+  "Bitumen Boiler",
+  "Chain Saw",
+  "Poker Vibrator",
+  "Jackhammer",
+  "Paver",
+  "Hand Sprayer",
+];
+
+const DAILY_MATERIAL_STANDARD_ITEMS = [
+  "Asphalt Concrete / Hot Mix",
+  "Bitumen",
+  "Bitumen Emulsion",
+  "Cabro blocks",
+  "Prime Coat",
+  "Tack Coat",
+  "Crusher Run",
+  "Gravel",
+  "Murram",
+  "Hardcore",
+  "Ballast",
+  "Sand",
+  "Cement",
+  "Water",
+  "Culverts",
+  "Concrete Pipes",
+  "Gabions",
+  "Geotextile",
+  "Kerbs",
+  "Road Marking Paint",
+  "Steel Reinforcement",
+  "Timber / Formwork",
+  "Fuel",
+  "Quarry Dust",
+  "Chippings",
+];
+
+function normalizeOtherItem(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/m³/g, "m3")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isOtherItem(value, standardItems) {
+  const raw = cleanText(value);
+  const normalized = normalizeOtherItem(raw);
+
+  if (!raw || !normalized) return false;
+  if (normalized === "other") return false;
+
+  const standardSet = new Set(
+    standardItems.map((item) => normalizeOtherItem(item))
+  );
+
+  return !standardSet.has(normalized);
+}
+
+function collectOtherItemsFromFormJson(formJson) {
+  const items = [];
+  const seen = new Set();
+
+  const addItem = ({ section, itemName, sourceField }) => {
+    const raw = cleanText(itemName);
+    const normalized = normalizeOtherItem(raw);
+
+    if (!raw || !normalized || normalized === "other") return;
+
+    const key = `${section}|${normalized}`;
+    if (seen.has(key)) return;
+
+    seen.add(key);
+
+    items.push({
+      section,
+      itemName: raw,
+      itemNormalized: normalized,
+      sourceField,
+    });
+  };
+
+  const plantRows = Array.isArray(formJson?.plantRows)
+    ? formJson.plantRows
+    : [];
+
+  plantRows.forEach((row) => {
+    if (isOtherItem(row?.description, DAILY_PLANT_STANDARD_ITEMS)) {
+      addItem({
+        section: "PLANT_EQUIPMENT",
+        itemName: row.description,
+        sourceField: "plantRows.description",
+      });
+    }
+  });
+
+  const materialRows = Array.isArray(formJson?.materialRows)
+    ? formJson.materialRows
+    : [];
+
+  materialRows.forEach((row) => {
+    if (isOtherItem(row?.description, DAILY_MATERIAL_STANDARD_ITEMS)) {
+      addItem({
+        section: "MATERIALS",
+        itemName: row.description,
+        sourceField: "materialRows.description",
+      });
+    }
+  });
+
+  const labourReturnRows = Array.isArray(formJson?.labourReturnRows)
+    ? formJson.labourReturnRows
+    : [];
+
+  labourReturnRows.forEach((row) => {
+    const rowNo = Number(row?.no);
+
+    // Rows 49 and 50 are your custom labour rows.
+    if (rowNo >= 49 && cleanText(row?.personnel)) {
+      addItem({
+        section: "LABOUR_RETURN",
+        itemName: row.personnel,
+        sourceField: "labourReturnRows.personnel",
+      });
+    }
+  });
+
+  return items;
+}
+
+async function saveOtherItemsForReport(reportId, userId) {
+  try {
+    const report = await getReport(reportId);
+    if (!report) return;
+
+    const formJson = parseFormJsonFromDb(report.form_json);
+    const otherItems = collectOtherItemsFromFormJson(formJson);
+
+    if (otherItems.length === 0) return;
+
+    for (const item of otherItems) {
+      await db.query(
+        `
+        INSERT INTO \`other\`
+          (
+            section,
+            item_name,
+            item_normalized,
+            source_field,
+            project_id,
+            report_id,
+            report_date,
+            created_by
+          )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          item_name = VALUES(item_name),
+          source_field = VALUES(source_field)
+        `,
+        [
+          item.section,
+          item.itemName,
+          item.itemNormalized,
+          item.sourceField,
+          report.project_id || null,
+          report.id,
+          report.report_date || null,
+          userId || report.created_by || null,
+        ]
+      );
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not save other items for report:", reportId, err);
+  }
+}
 // ---------------- ROUTES ----------------
 
 /**
@@ -1900,6 +2140,26 @@ router.put("/:id/submit", authenticateJWT, async (req, res) => {
       userRole: req.user.role,
       notes: req.body?.notes || null,
     });
+
+    await saveOtherItemsForReport(report.id, req.user.id);
+
+    /** Run this in DB to see what users keep typing to add to dropdown
+     * SELECT
+          section,
+          item_name,
+          COUNT(*) AS times_used,
+          MIN(created_at) AS first_seen,
+          MAX(created_at) AS last_seen
+        FROM `other`
+        GROUP BY section, item_normalized, item_name
+        ORDER BY times_used DESC, last_seen DESC;
+
+        results like
+
+        PLANT_EQUIPMENT | Forklift        | 12
+        MATERIALS       | Cold mix asphalt| 7
+        LABOUR_RETURN   | Drone Operator  | 3
+     */
 
     if (report.amendment_of_report_id) {
       await db.query(
