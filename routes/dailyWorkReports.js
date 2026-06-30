@@ -309,6 +309,13 @@ function cleanText(value) {
   return String(value || "").trim();
 }
 
+function normalizePlateNo(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
 function normalizePlantName(value) {
   const raw = cleanText(value);
   const key = raw.toLowerCase().replace(/\s+/g, " ");
@@ -964,9 +971,10 @@ router.get("/plant-equipment-summary", authenticateJWT, async (req, res) => {
 
         const item = targetMap.get(normalizedName);
 
-        const plateNo = cleanText(row.plateNo);
+        const plateNo = normalizePlateNo(row.plateNo);
+
         if (plateNo) {
-          item.plateNumbers.add(plateNo.toUpperCase());
+          item.plateNumbers.add(plateNo);
         } else {
           item.count += 1;
         }
