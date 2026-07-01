@@ -346,7 +346,7 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
       });
     }
 
-    const [rows] = await db.query(
+   const [rows] = await db.query(
       `
       SELECT
         p.id AS project_id,
@@ -374,26 +374,63 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
         awl.method,
         awl.chainage_start,
         awl.chainage_end,
+
         awl.planned_quantity,
         awl.planned_rate,
-        awl.planned_amount
+        awl.planned_amount,
+
+        COALESCE(wi_used.already_instructed_quantity, 0) AS already_instructed_quantity,
+
+        GREATEST(
+          COALESCE(awl.planned_quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
+          0
+        ) AS pending_quantity,
+
+        (
+          GREATEST(
+            COALESCE(awl.planned_quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
+            0
+          ) * COALESCE(awl.planned_rate, 0)
+        ) AS pending_amount
+
       FROM annual_workplan_project_lots awpl
+
       JOIN projects p
         ON p.id = awpl.project_id
+
       JOIN annual_workplan_lines awl
         ON awl.workplan_id = awpl.workplan_id
         AND awl.lot_no = awpl.lot_no
         AND awl.category = awpl.category
+
       JOIN roads r
         ON r.id = awl.road_id
+
       JOIN activities a
         ON a.id = awl.activity_id
+
+      LEFT JOIN (
+        SELECT
+          workplan_line_id,
+          SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+        FROM work_instructions
+        WHERE project_id = ?
+          AND workplan_line_id IS NOT NULL
+          AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+        GROUP BY workplan_line_id
+      ) wi_used
+        ON wi_used.workplan_line_id = awl.id
+
       WHERE p.id = ?
         AND awl.status <> 'cancelled'
         AND awl.is_ignored = 0
-      ORDER BY r.road_name ASC, a.code ASC, awl.id ASC
+
+      ORDER BY
+        r.road_name ASC,
+        a.code ASC,
+        awl.id ASC
       `,
-      [projectId]
+      [projectId, projectId]
     );
 
     return res.json({
