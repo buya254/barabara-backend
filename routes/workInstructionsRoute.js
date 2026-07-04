@@ -346,7 +346,7 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
       });
     }
 
-   const [rows] = await db.query(
+    const [rows] = await db.query(
       `
       SELECT
         p.id AS project_id,
@@ -357,78 +357,82 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
         p.region,
         p.financial_year,
 
-        awpl.lot_no,
-        awl.id AS workplan_line_id,
-        awl.road_id,
+        bl.id AS boq_lot_id,
+        bl.lot_no,
+        bl.category,
+        bl.locked_contract_sum,
+
+        bql.id AS boq_line_id,
+        bql.source_arwp_line_id AS workplan_line_id,
+
+        bql.road_id,
         r.road_code,
         r.road_name,
 
-        awl.activity_id,
+        bql.activity_id,
         a.code AS activity_code,
         a.name AS activity_name,
         a.unit AS unit_of_measure,
         a.work_category,
         a.work_description,
 
-        awl.category,
-        awl.method,
-        awl.chainage_start,
-        awl.chainage_end,
+        bql.category,
+        bql.method,
+        bql.chainage_start,
+        bql.chainage_end,
 
-        awl.planned_quantity,
-        awl.planned_rate,
-        awl.planned_amount,
+        bql.quantity AS planned_quantity,
+        bql.rate AS planned_rate,
+        bql.amount AS planned_amount,
 
         COALESCE(wi_used.already_instructed_quantity, 0) AS already_instructed_quantity,
 
         GREATEST(
-          COALESCE(awl.planned_quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
+          COALESCE(bql.quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
           0
         ) AS pending_quantity,
 
         (
           GREATEST(
-            COALESCE(awl.planned_quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
+            COALESCE(bql.quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
             0
-          ) * COALESCE(awl.planned_rate, 0)
+          ) * COALESCE(bql.rate, 0)
         ) AS pending_amount
 
-      FROM annual_workplan_project_lots awpl
+      FROM boq_lots bl
 
       JOIN projects p
-        ON p.id = awpl.project_id
+        ON p.id = bl.project_id
 
-      JOIN annual_workplan_lines awl
-        ON awl.workplan_id = awpl.workplan_id
-        AND awl.lot_no = awpl.lot_no
-        AND awl.category = awpl.category
+      JOIN boq_lines bql
+        ON bql.boq_lot_id = bl.id
 
       JOIN roads r
-        ON r.id = awl.road_id
+        ON r.id = bql.road_id
 
       JOIN activities a
-        ON a.id = awl.activity_id
+        ON a.id = bql.activity_id
 
       LEFT JOIN (
         SELECT
-          workplan_line_id,
+          boq_line_id,
           SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
         FROM work_instructions
         WHERE project_id = ?
-          AND workplan_line_id IS NOT NULL
+          AND boq_line_id IS NOT NULL
           AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
-        GROUP BY workplan_line_id
+        GROUP BY boq_line_id
       ) wi_used
-        ON wi_used.workplan_line_id = awl.id
+        ON wi_used.boq_line_id = bql.id
 
-      WHERE p.id = ?
-        AND awl.status <> 'cancelled'
-        AND awl.is_ignored = 0
+      WHERE bl.project_id = ?
+        AND bl.is_locked = 1
+        AND bql.status = 'active'
 
       ORDER BY
         r.road_name ASC,
         a.code ASC,
-        awl.id ASC
+        bql.id ASC
       `,
       [projectId, projectId]
     );
@@ -577,11 +581,85 @@ router.post("/", authenticateJWT, async (req, res) => {
     const insertedIds = [];
 
     for (const line of lines) {
-      const [result] = await conn.query(
+  const boqLineId = Number(line.boq_line_id || 0);
+  const requestedQty = Number(line.instructed_quantity || line.estimated_quantity || 0);
+
+  if (!Number.isInteger(boqLineId) || boqLineId <= 0) {
+    throw new Error(
+      "Work Instruction must be created from a locked BOQ line. Lock the ARWP into BOQ first."
+    );
+  }
+
+  if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
+    throw new Error(
+      "Each selected BOQ work item must have an instructed quantity greater than zero."
+    );
+  }
+
+  const [pendingRows] = await conn.query(
+    `
+    SELECT
+      bql.id AS boq_line_id,
+      bql.quantity,
+      bql.rate,
+      COALESCE(used.already_instructed_quantity, 0) AS already_instructed_quantity,
+      GREATEST(
+        COALESCE(bql.quantity, 0) - COALESCE(used.already_instructed_quantity, 0),
+        0
+      ) AS pending_quantity,
+      r.road_code,
+      a.code AS activity_code,
+      a.name AS activity_name
+    FROM boq_lines bql
+
+    INNER JOIN boq_lots bl
+      ON bl.id = bql.boq_lot_id
+
+    INNER JOIN roads r
+      ON r.id = bql.road_id
+
+    INNER JOIN activities a
+      ON a.id = bql.activity_id
+
+    LEFT JOIN (
+      SELECT
+        boq_line_id,
+        SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+      FROM work_instructions
+      WHERE project_id = ?
+        AND boq_line_id IS NOT NULL
+        AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+      GROUP BY boq_line_id
+    ) used
+      ON used.boq_line_id = bql.id
+
+    WHERE bql.id = ?
+      AND bl.project_id = ?
+      AND bl.is_locked = 1
+      AND bql.status = 'active'
+    LIMIT 1
+    `,
+    [projectId, boqLineId, projectId]
+  );
+
+  if (pendingRows.length === 0) {
+    throw new Error("Selected BOQ work item was not found for this project.");
+  }
+
+  const pendingQty = Number(pendingRows[0].pending_quantity || 0);
+
+  if (requestedQty > pendingQty) {
+    throw new Error(
+      `Cannot instruct ${requestedQty}. Pending quantity for ${pendingRows[0].road_code} / ${pendingRows[0].activity_code} is only ${pendingQty}.`
+    );
+  }
+
+  const [result] = await conn.query(
         `
         INSERT INTO work_instructions
           (
             workplan_line_id,
+            boq_line_id,
             project_id,
             project_name_snapshot,
             road_id,
@@ -612,10 +690,11 @@ router.post("/", authenticateJWT, async (req, res) => {
             additional_instruction_notes
           )
         VALUES
-          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           line.workplan_line_id || null,
+          line.boq_line_id || null,
           projectId,
           line.project_name_snapshot ||
             project.project_name ||

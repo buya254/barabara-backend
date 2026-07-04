@@ -1554,63 +1554,80 @@ router.get("/:id/lots", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const [rows] = await db.query(
-      `
-        SELECT
-          awl.workplan_id,
-          awl.lot_no,
-          awl.category,
+   const [rows] = await db.query(
+  `
+    SELECT
+      awl.workplan_id,
+      awl.lot_no,
+      awl.category,
 
-          COUNT(*) AS line_count,
-          COUNT(DISTINCT awl.road_id) AS road_count,
+      COUNT(*) AS line_count,
+      COUNT(DISTINCT awl.road_id) AS road_count,
 
-          SUM(CASE WHEN awl.is_ignored = 1 THEN 1 ELSE 0 END) AS ignored_line_count,
-          SUM(CASE WHEN awl.is_ignored = 0 THEN 1 ELSE 0 END) AS active_line_count,
+      SUM(CASE WHEN awl.is_ignored = 1 THEN 1 ELSE 0 END) AS ignored_line_count,
+      SUM(CASE WHEN awl.is_ignored = 0 THEN 1 ELSE 0 END) AS active_line_count,
 
-          COALESCE(
-            SUM(
-              CASE 
-                WHEN awl.is_ignored = 0 THEN awl.planned_amount 
-                ELSE 0 
-              END
-            ),
-            0
-          ) AS active_planned_amount,
+      COALESCE(
+        SUM(
+          CASE 
+            WHEN awl.is_ignored = 0 THEN awl.planned_amount 
+            ELSE 0 
+          END
+        ),
+        0
+      ) AS active_planned_amount,
 
-          awpl.project_id AS linked_project_id,
-          p.project_number AS linked_project_number,
-          p.project_name AS linked_project_name
+      awpl.project_id AS linked_project_id,
+      p.project_number AS linked_project_number,
+      p.project_name AS linked_project_name,
 
-        FROM annual_workplan_lines awl
+      bl.id AS boq_lot_id,
+      COALESCE(bl.is_locked, 0) AS boq_locked,
+      bl.locked_contract_sum AS boq_locked_contract_sum,
+      bl.locked_at AS boq_locked_at,
+      bl.locked_by AS boq_locked_by
 
-        LEFT JOIN annual_workplan_project_lots awpl
-          ON awpl.workplan_id = awl.workplan_id
-          AND awpl.lot_no = awl.lot_no
-          AND awpl.category = awl.category
+    FROM annual_workplan_lines awl
 
-        LEFT JOIN projects p
-          ON p.id = awpl.project_id
+    LEFT JOIN annual_workplan_project_lots awpl
+      ON awpl.workplan_id = awl.workplan_id
+      AND awpl.lot_no = awl.lot_no
+      AND awpl.category = awl.category
 
-        WHERE awl.workplan_id = ?
-          AND awl.status <> 'cancelled'
-          AND awl.lot_no IS NOT NULL
-          AND awl.category IS NOT NULL
+    LEFT JOIN projects p
+      ON p.id = awpl.project_id
 
-        GROUP BY
-          awl.workplan_id,
-          awl.lot_no,
-          awl.category,
-          awpl.project_id,
-          p.project_number,
-          p.project_name
+    LEFT JOIN boq_lots bl
+      ON bl.workplan_id = awl.workplan_id
+      AND bl.lot_no = awl.lot_no
+      AND bl.category = awl.category
+      AND bl.project_id = awpl.project_id
 
-        ORDER BY
-          CAST(awl.lot_no AS UNSIGNED),
-          awl.lot_no,
-          awl.category
-      `,
-      [id]
-    );
+    WHERE awl.workplan_id = ?
+      AND awl.status <> 'cancelled'
+      AND awl.lot_no IS NOT NULL
+      AND awl.category IS NOT NULL
+
+    GROUP BY
+      awl.workplan_id,
+      awl.lot_no,
+      awl.category,
+      awpl.project_id,
+      p.project_number,
+      p.project_name,
+      bl.id,
+      bl.is_locked,
+      bl.locked_contract_sum,
+      bl.locked_at,
+      bl.locked_by
+
+    ORDER BY
+      CAST(awl.lot_no AS UNSIGNED),
+      awl.lot_no,
+      awl.category
+  `,
+  [id]
+); 
 
     res.json(rows);
   } catch (error) {
@@ -1619,6 +1636,238 @@ router.get("/:id/lots", async (req, res) => {
       message: "Failed to fetch ARWP lots",
       error: error.message,
     });
+  }
+});
+
+/**
+ * POST /api/annual-workplans/seal-boq-copy
+ * Copies the currently saved ARWP lot/category lines into BOQ tables.
+ * This does NOT change annual_workplan_lines.
+ */
+router.post("/seal-boq-copy", async (req, res) => {
+  let connection;
+
+  try {
+    const { workplan_id, project_id, lot_no, category, notes } = req.body;
+
+    if (!workplan_id || !project_id || !lot_no || !category) {
+      return res.status(400).json({
+        message: "workplan_id, project_id, lot_no, and category are required",
+      });
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [linkedRows] = await connection.query(
+      `
+      SELECT
+        awpl.workplan_id,
+        awpl.project_id,
+        awpl.lot_no,
+        awpl.category,
+        p.project_number,
+        p.project_name
+      FROM annual_workplan_project_lots awpl
+      LEFT JOIN projects p
+        ON p.id = awpl.project_id
+      WHERE awpl.workplan_id = ?
+        AND awpl.project_id = ?
+        AND awpl.lot_no = ?
+        AND awpl.category = ?
+      LIMIT 1
+      `,
+      [workplan_id, project_id, lot_no, category]
+    );
+
+    if (linkedRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        message: "This ARWP lot/category is not linked to this project.",
+      });
+    }
+
+    const [existingRows] = await connection.query(
+      `
+      SELECT id, is_locked
+      FROM boq_lots
+      WHERE workplan_id = ?
+        AND project_id = ?
+        AND lot_no = ?
+        AND category = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [workplan_id, project_id, lot_no, category]
+    );
+
+    if (
+      existingRows.length > 0 &&
+      Number(existingRows[0].is_locked || 0) === 1
+    ) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: "This ARWP lot/category has already been locked into BOQ.",
+        boq_lot_id: existingRows[0].id,
+      });
+    }
+
+    const [sumRows] = await connection.query(
+      `
+      SELECT
+        COALESCE(
+          SUM(
+            CASE
+              WHEN awl.is_ignored = 0 THEN awl.planned_amount
+              ELSE 0
+            END
+          ),
+          0
+        ) AS active_arwp_amount,
+        COUNT(*) AS active_line_count
+      FROM annual_workplan_lines awl
+      WHERE awl.workplan_id = ?
+        AND awl.lot_no = ?
+        AND awl.category = ?
+        AND awl.status <> 'cancelled'
+        AND awl.is_ignored = 0
+      `,
+      [workplan_id, lot_no, category]
+    );
+
+    const activeArwpAmount = Number(sumRows[0]?.active_arwp_amount || 0);
+    const activeLineCount = Number(sumRows[0]?.active_line_count || 0);
+
+    if (!Number.isFinite(activeArwpAmount) || activeArwpAmount <= 0) {
+      await connection.rollback();
+      return res.status(400).json({
+        message: "Cannot lock BOQ because the active ARWP amount is zero.",
+      });
+    }
+
+    if (activeLineCount <= 0) {
+      await connection.rollback();
+      return res.status(400).json({
+        message: "Cannot lock BOQ because there are no active ARWP lines.",
+      });
+    }
+
+    const [createdLot] = await connection.query(
+      `
+      INSERT INTO boq_lots
+        (
+          workplan_id,
+          project_id,
+          lot_no,
+          category,
+          locked_contract_sum,
+          source_arwp_amount,
+          is_locked,
+          locked_by,
+          notes
+        )
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `,
+      [
+        workplan_id,
+        project_id,
+        lot_no,
+        category,
+        activeArwpAmount,
+        activeArwpAmount,
+        req.user?.id || null,
+        notes || "Locked from adjusted ARWP View/Edit Lines",
+      ]
+    );
+
+    const boqLotId = createdLot.insertId;
+
+    const [copiedLines] = await connection.query(
+      `
+      INSERT INTO boq_lines
+        (
+          boq_lot_id,
+          source_arwp_line_id,
+          workplan_id,
+          project_id,
+          road_id,
+          activity_id,
+          financial_year,
+          lot_no,
+          category,
+          method,
+          chainage_start,
+          chainage_end,
+          quantity,
+          rate,
+          remarks,
+          status,
+          line_origin,
+          created_by,
+          updated_by
+        )
+      SELECT
+        ? AS boq_lot_id,
+        awl.id AS source_arwp_line_id,
+        awl.workplan_id,
+        ? AS project_id,
+        awl.road_id,
+        awl.activity_id,
+        awl.financial_year,
+        awl.lot_no,
+        awl.category,
+        awl.method,
+        awl.chainage_start,
+        awl.chainage_end,
+        awl.planned_quantity AS quantity,
+        awl.planned_rate AS rate,
+        awl.remarks,
+        'active' AS status,
+        'SEALED_ARWP_COPY' AS line_origin,
+        ? AS created_by,
+        ? AS updated_by
+      FROM annual_workplan_lines awl
+      WHERE awl.workplan_id = ?
+        AND awl.lot_no = ?
+        AND awl.category = ?
+        AND awl.status <> 'cancelled'
+        AND awl.is_ignored = 0
+      ORDER BY awl.road_id, awl.activity_id, awl.id
+      `,
+      [
+        boqLotId,
+        project_id,
+        req.user?.id || null,
+        req.user?.id || null,
+        workplan_id,
+        lot_no,
+        category,
+      ]
+    );
+
+    await connection.commit();
+
+    return res.status(201).json({
+      message: "ARWP locked and BOQ copy created successfully.",
+      boq_lot_id: boqLotId,
+      locked_contract_sum: activeArwpAmount,
+      copied_lines: copiedLines.affectedRows,
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    console.error("Error sealing ARWP into BOQ:", error);
+
+    return res.status(500).json({
+      message: "Failed to lock ARWP into BOQ copy.",
+      error: error.message,
+    });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
