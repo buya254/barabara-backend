@@ -328,23 +328,208 @@ router.get("/project/:projectId/usage", authenticateJWT, async (req, res) => {
   }
 });
 
-// GET /api/work-instructions/project/:projectId/arwp-lines
-// R.E uses this to pick ARWP activity placeholders when creating a Site Instruction.
-router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) => {
+router.get("/activities/search", async (req, res) => {
   try {
-    const projectId = Number(req.params.projectId);
+    const q = String(req.query.q || "").trim();
 
-    if (!Number.isInteger(projectId) || projectId <= 0) {
-      return res.status(400).json({ message: "Invalid project id." });
-    }
-
-    const allowed = await canViewProjectInstructions(req.user, projectId);
-
-    if (!allowed) {
-      return res.status(403).json({
-        message: "You are not allowed to view ARWP lines for this project.",
+    if (q.length < 2) {
+      return res.json({
+        success: true,
+        activities: [],
       });
     }
+
+    const like = `%${q}%`;
+    const prefix = `${q}%`;
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        id AS activity_id,
+        code AS activity_code,
+        name AS activity_name,
+        unit AS unit_of_measure,
+        work_category,
+        work_description,
+        0 AS planned_rate
+      FROM activities
+      WHERE
+        code LIKE ?
+        OR name LIKE ?
+        OR work_description LIKE ?
+      ORDER BY
+        CASE
+          WHEN code LIKE ? THEN 1
+          WHEN name LIKE ? THEN 2
+          ELSE 3
+        END,
+        code ASC
+      LIMIT 12
+      `,
+      [like, like, like, prefix, prefix]
+    );
+
+    return res.json({
+      success: true,
+      activities: rows,
+    });
+  } catch (err) {
+    console.error("❌ Failed to search activities:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to search activities.",
+    });
+  }
+});
+
+// GET /api/work-instructions/project/:projectId/arwp-lines
+// R.E uses this to pick ARWP activity placeholders when creating a Site Instruction.
+router.get("/project/:projectId/arwp-lines", async (req, res) => {
+  const projectId = Number(req.params.projectId);
+  const userId = req.user?.id || req.user?.userId || null;
+
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid project ID.",
+    });
+  }
+
+  const conn = await db.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    const [lockedLots] = await conn.query(
+      `
+      SELECT
+        bl.id AS boq_lot_id,
+        bl.workplan_id,
+        bl.project_id,
+        bl.lot_no,
+        bl.category,
+        bl.locked_contract_sum
+      FROM boq_lots bl
+      WHERE bl.project_id = ?
+        AND bl.is_locked = 1
+      ORDER BY bl.id ASC
+      `,
+      [projectId]
+    );
+
+    if (lockedLots.length === 0) {
+      await conn.commit();
+
+      return res.json({
+        success: true,
+        arwpLines: [],
+      });
+    }
+
+    for (const lot of lockedLots) {
+      await conn.query(
+        `
+        INSERT INTO wi_boq_lots
+          (
+            project_id,
+            boq_lot_id,
+            locked_contract_sum,
+            available_amount,
+            created_by,
+            updated_by
+          )
+        VALUES
+          (?, ?, ?, 0, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          updated_by = updated_by
+        `,
+        [
+          lot.project_id,
+          lot.boq_lot_id,
+          lot.locked_contract_sum || 0,
+          userId,
+          userId,
+        ]
+      );
+    }
+
+    await conn.query(
+      `
+      INSERT INTO wi_boq_lines
+        (
+          wi_boq_lot_id,
+          project_id,
+          boq_lot_id,
+          source_boq_line_id,
+          road_id,
+          activity_id,
+          activity_code_snapshot,
+          activity_name_snapshot,
+          unit_snapshot,
+          section_text,
+          source_quantity,
+          source_rate,
+          source_amount,
+          adjusted_quantity,
+          adjusted_rate,
+          adjusted_amount,
+          notes,
+          line_origin,
+          status,
+          created_by,
+          updated_by
+        )
+      SELECT
+        wbl.id,
+        bl.project_id,
+        bl.id,
+        bql.id,
+        bql.road_id,
+        bql.activity_id,
+        a.code,
+        a.name,
+        a.unit,
+        COALESCE(
+          bql.wi_section_text,
+          CONCAT(COALESCE(bql.chainage_start, 0), ' - ', COALESCE(bql.chainage_end, 0))
+        ),
+        COALESCE(bql.quantity, 0),
+        COALESCE(bql.rate, 0),
+        COALESCE(bql.amount, 0),
+        COALESCE(bql.quantity, 0),
+        COALESCE(bql.rate, 0),
+        COALESCE(bql.amount, 0),
+        bql.remarks,
+        'LOCKED_BOQ_COPY',
+        'active',
+        ?,
+        ?
+      FROM boq_lines bql
+
+      INNER JOIN boq_lots bl
+        ON bl.id = bql.boq_lot_id
+
+      INNER JOIN wi_boq_lots wbl
+        ON wbl.project_id = bl.project_id
+        AND wbl.boq_lot_id = bl.id
+
+      INNER JOIN activities a
+        ON a.id = bql.activity_id
+
+      LEFT JOIN wi_boq_lines existing
+        ON existing.project_id = bl.project_id
+        AND existing.source_boq_line_id = bql.id
+
+      WHERE bl.project_id = ?
+        AND bl.is_locked = 1
+        AND bql.status = 'active'
+        AND existing.id IS NULL
+      `,
+      [userId, userId, projectId]
+    );
+
+    await conn.commit();
 
     const [rows] = await db.query(
       `
@@ -357,61 +542,149 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
         p.region,
         p.financial_year,
 
-        bl.id AS boq_lot_id,
+        wbl.id AS wi_boq_lot_id,
+        wbl.available_amount AS wi_available_amount,
+        wbl.locked_contract_sum,
+
+        wbl.boq_lot_id,
         bl.lot_no,
         bl.category,
-        bl.locked_contract_sum,
 
-        bql.id AS boq_line_id,
-        bql.source_arwp_line_id AS workplan_line_id,
+        wbln.id AS wi_boq_line_id,
+        wbln.source_boq_line_id AS boq_line_id,
+        NULL AS workplan_line_id,
 
-        bql.road_id,
+        wbln.road_id,
         r.road_code,
         r.road_name,
 
-        bql.activity_id,
-        a.code AS activity_code,
-        a.name AS activity_name,
-        a.unit AS unit_of_measure,
+        wbln.activity_id,
+        COALESCE(wbln.activity_code_snapshot, a.code) AS activity_code,
+        COALESCE(wbln.activity_name_snapshot, a.name) AS activity_name,
+        COALESCE(wbln.unit_snapshot, a.unit) AS unit_of_measure,
         a.work_category,
         a.work_description,
 
-        bql.category,
-        bql.method,
-        bql.chainage_start,
-        bql.chainage_end,
+        source_bql.chainage_start,
+        source_bql.chainage_end,
 
-        bql.quantity AS planned_quantity,
-        bql.rate AS planned_rate,
-        bql.amount AS planned_amount,
+        wbln.section_text AS wi_section_text,
 
-        COALESCE(wi_used.already_instructed_quantity, 0) AS already_instructed_quantity,
+        wbln.source_quantity AS planned_quantity,
+        CASE
+          WHEN COALESCE(wbln.source_rate, 0) > 0
+            THEN wbln.source_rate
+          ELSE wbln.adjusted_rate
+        END AS planned_rate,
+        wbln.source_amount AS planned_amount,
+
+        (
+          COALESCE(wi_used.already_instructed_quantity, 0)
+          +
+          COALESCE(old_used.already_instructed_quantity, 0)
+        ) AS already_instructed_quantity,
+
+        CASE
+          WHEN wbln.line_origin = 'ENGINEER_ADDED' THEN 0
+          ELSE GREATEST(
+            COALESCE(wbln.source_quantity, 0)
+            -
+            (
+              COALESCE(wi_used.already_instructed_quantity, 0)
+              +
+              COALESCE(old_used.already_instructed_quantity, 0)
+            ),
+            0
+          )
+        END AS original_pending_quantity,
+
+        CASE
+          WHEN wbln.line_origin = 'ENGINEER_ADDED' THEN 0
+          WHEN COALESCE(wbln.source_quantity, 0) <= 0 THEN 0
+          ELSE
+            COALESCE(wbln.source_amount, 0)
+            *
+            (
+              GREATEST(
+                COALESCE(wbln.source_quantity, 0)
+                -
+                (
+                  COALESCE(wi_used.already_instructed_quantity, 0)
+                  +
+                  COALESCE(old_used.already_instructed_quantity, 0)
+                ),
+                0
+              )
+              /
+              COALESCE(wbln.source_quantity, 1)
+            )
+        END AS original_pending_amount,
 
         GREATEST(
-          COALESCE(bql.quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
+          COALESCE(wbln.adjusted_quantity, 0)
+          -
+          (
+            COALESCE(wi_used.already_instructed_quantity, 0)
+            +
+            COALESCE(old_used.already_instructed_quantity, 0)
+          ),
           0
         ) AS pending_quantity,
 
-        (
-          GREATEST(
-            COALESCE(bql.quantity, 0) - COALESCE(wi_used.already_instructed_quantity, 0),
-            0
-          ) * COALESCE(bql.rate, 0)
-        ) AS pending_amount
+        CASE
+          WHEN COALESCE(wbln.adjusted_quantity, 0) <= 0 THEN 0
+          ELSE
+            COALESCE(wbln.adjusted_amount, 0)
+            *
+            (
+              GREATEST(
+                COALESCE(wbln.adjusted_quantity, 0)
+                -
+                (
+                  COALESCE(wi_used.already_instructed_quantity, 0)
+                  +
+                  COALESCE(old_used.already_instructed_quantity, 0)
+                ),
+                0
+              )
+              /
+              COALESCE(wbln.adjusted_quantity, 1)
+            )
+        END AS pending_amount,
 
-      FROM boq_lots bl
+        wbln.line_origin
 
-      JOIN projects p
-        ON p.id = bl.project_id
+      FROM wi_boq_lines wbln
 
-      JOIN boq_lines bql
-        ON bql.boq_lot_id = bl.id
+      INNER JOIN wi_boq_lots wbl
+        ON wbl.id = wbln.wi_boq_lot_id
 
-      JOIN roads r
-        ON r.id = bql.road_id
+      INNER JOIN boq_lots bl
+        ON bl.id = wbln.boq_lot_id
 
-      JOIN activities a
-        ON a.id = bql.activity_id
+      INNER JOIN projects p
+        ON p.id = wbln.project_id
+
+      INNER JOIN roads r
+        ON r.id = wbln.road_id
+
+      INNER JOIN activities a
+        ON a.id = wbln.activity_id
+
+      LEFT JOIN boq_lines source_bql
+        ON source_bql.id = wbln.source_boq_line_id
+
+      LEFT JOIN (
+        SELECT
+          wi_boq_line_id,
+          SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+        FROM work_instructions
+        WHERE project_id = ?
+          AND wi_boq_line_id IS NOT NULL
+          AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+        GROUP BY wi_boq_line_id
+      ) wi_used
+        ON wi_used.wi_boq_line_id = wbln.id
 
       LEFT JOIN (
         SELECT
@@ -419,22 +692,22 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
           SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
         FROM work_instructions
         WHERE project_id = ?
+          AND wi_boq_line_id IS NULL
           AND boq_line_id IS NOT NULL
           AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
         GROUP BY boq_line_id
-      ) wi_used
-        ON wi_used.boq_line_id = bql.id
+      ) old_used
+        ON old_used.boq_line_id = wbln.source_boq_line_id
 
-      WHERE bl.project_id = ?
-        AND bl.is_locked = 1
-        AND bql.status = 'active'
+      WHERE wbln.project_id = ?
+        AND wbln.status = 'active'
 
       ORDER BY
         r.road_name ASC,
-        a.code ASC,
-        bql.id ASC
+        activity_code ASC,
+        wbln.id ASC
       `,
-      [projectId, projectId]
+      [projectId, projectId, projectId]
     );
 
     return res.json({
@@ -442,10 +715,15 @@ router.get("/project/:projectId/arwp-lines", authenticateJWT, async (req, res) =
       arwpLines: rows,
     });
   } catch (err) {
-    console.error("ARWP lines for work instruction error:", err);
+    await conn.rollback();
+    console.error("❌ Failed to load WI BOQ lines:", err);
+
     return res.status(500).json({
-      message: "Failed to load ARWP activity lines.",
+      success: false,
+      message: err.message || "Failed to load WI BOQ lines.",
     });
+  } finally {
+    conn.release();
   }
 });
 
@@ -565,7 +843,7 @@ router.post("/", authenticateJWT, async (req, res) => {
 
     const assignment = await getWorkflowAssignment(projectId);
     const finalIssuedToUserId =
-        issued_to_user_id || assignment?.siteagent_id || null;
+      issued_to_user_id || assignment?.siteagent_id || null;
 
     const finalInstructionNumber =
       String(d365_instruction_no || instruction_number || "").trim() ||
@@ -581,85 +859,170 @@ router.post("/", authenticateJWT, async (req, res) => {
     const insertedIds = [];
 
     for (const line of lines) {
-  const boqLineId = Number(line.boq_line_id || 0);
-  const requestedQty = Number(line.instructed_quantity || line.estimated_quantity || 0);
+      const wiBoqLineId = Number(line.wi_boq_line_id || 0);
+      const boqLineId = Number(line.boq_line_id || 0);
+      const requestedQty = Number(
+        line.instructed_quantity || line.estimated_quantity || 0
+      );
 
-  if (!Number.isInteger(boqLineId) || boqLineId <= 0) {
-    throw new Error(
-      "Work Instruction must be created from a locked BOQ line. Lock the ARWP into BOQ first."
-    );
-  }
+      if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
+        throw new Error(
+          "Each selected BOQ work item must have an instructed quantity greater than zero."
+        );
+      }
 
-  if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
-    throw new Error(
-      "Each selected BOQ work item must have an instructed quantity greater than zero."
-    );
-  }
+      let pendingRows = [];
 
-  const [pendingRows] = await conn.query(
-    `
-    SELECT
-      bql.id AS boq_line_id,
-      bql.quantity,
-      bql.rate,
-      COALESCE(used.already_instructed_quantity, 0) AS already_instructed_quantity,
-      GREATEST(
-        COALESCE(bql.quantity, 0) - COALESCE(used.already_instructed_quantity, 0),
-        0
-      ) AS pending_quantity,
-      r.road_code,
-      a.code AS activity_code,
-      a.name AS activity_name
-    FROM boq_lines bql
+      if (Number.isInteger(wiBoqLineId) && wiBoqLineId > 0) {
+        const [rows] = await conn.query(
+          `
+          SELECT
+            wbln.id AS wi_boq_line_id,
+            wbln.source_boq_line_id AS boq_line_id,
+            wbln.road_id,
+            wbln.activity_id,
+            wbln.adjusted_rate AS rate,
+            COALESCE(wi_used.already_instructed_quantity, 0) AS wi_already_instructed_quantity,
+            COALESCE(old_used.already_instructed_quantity, 0) AS old_already_instructed_quantity,
+            GREATEST(
+              COALESCE(wbln.adjusted_quantity, 0)
+              -
+              (
+                COALESCE(wi_used.already_instructed_quantity, 0)
+                +
+                COALESCE(old_used.already_instructed_quantity, 0)
+              ),
+              0
+            ) AS pending_quantity,
+            r.road_code,
+            r.road_name,
+            COALESCE(wbln.activity_code_snapshot, a.code) AS activity_code,
+            COALESCE(wbln.activity_name_snapshot, a.name) AS activity_name,
+            COALESCE(wbln.unit_snapshot, a.unit) AS unit_of_measure
+          FROM wi_boq_lines wbln
 
-    INNER JOIN boq_lots bl
-      ON bl.id = bql.boq_lot_id
+          INNER JOIN roads r
+            ON r.id = wbln.road_id
 
-    INNER JOIN roads r
-      ON r.id = bql.road_id
+          INNER JOIN activities a
+            ON a.id = wbln.activity_id
 
-    INNER JOIN activities a
-      ON a.id = bql.activity_id
+          LEFT JOIN (
+            SELECT
+              wi_boq_line_id,
+              SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+            FROM work_instructions
+            WHERE project_id = ?
+              AND wi_boq_line_id IS NOT NULL
+              AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+            GROUP BY wi_boq_line_id
+          ) wi_used
+            ON wi_used.wi_boq_line_id = wbln.id
 
-    LEFT JOIN (
-      SELECT
-        boq_line_id,
-        SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
-      FROM work_instructions
-      WHERE project_id = ?
-        AND boq_line_id IS NOT NULL
-        AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
-      GROUP BY boq_line_id
-    ) used
-      ON used.boq_line_id = bql.id
+          LEFT JOIN (
+            SELECT
+              boq_line_id,
+              SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+            FROM work_instructions
+            WHERE project_id = ?
+              AND wi_boq_line_id IS NULL
+              AND boq_line_id IS NOT NULL
+              AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+            GROUP BY boq_line_id
+          ) old_used
+            ON old_used.boq_line_id = wbln.source_boq_line_id
 
-    WHERE bql.id = ?
-      AND bl.project_id = ?
-      AND bl.is_locked = 1
-      AND bql.status = 'active'
-    LIMIT 1
-    `,
-    [projectId, boqLineId, projectId]
-  );
+          WHERE wbln.id = ?
+            AND wbln.project_id = ?
+            AND wbln.status = 'active'
+          LIMIT 1
+          `,
+          [projectId, projectId, wiBoqLineId, projectId]
+        );
 
-  if (pendingRows.length === 0) {
-    throw new Error("Selected BOQ work item was not found for this project.");
-  }
+        pendingRows = rows;
+      } else if (Number.isInteger(boqLineId) && boqLineId > 0) {
+        const [rows] = await conn.query(
+          `
+          SELECT
+            bql.id AS boq_line_id,
+            NULL AS wi_boq_line_id,
+            bql.road_id,
+            bql.activity_id,
+            bql.rate,
+            COALESCE(used.already_instructed_quantity, 0) AS already_instructed_quantity,
+            GREATEST(
+              COALESCE(bql.quantity, 0) -
+              COALESCE(used.already_instructed_quantity, 0),
+              0
+            ) AS pending_quantity,
+            r.road_code,
+            r.road_name,
+            a.code AS activity_code,
+            a.name AS activity_name,
+            a.unit AS unit_of_measure
+          FROM boq_lines bql
 
-  const pendingQty = Number(pendingRows[0].pending_quantity || 0);
+          INNER JOIN boq_lots bl
+            ON bl.id = bql.boq_lot_id
 
-  if (requestedQty > pendingQty) {
-    throw new Error(
-      `Cannot instruct ${requestedQty}. Pending quantity for ${pendingRows[0].road_code} / ${pendingRows[0].activity_code} is only ${pendingQty}.`
-    );
-  }
+          INNER JOIN roads r
+            ON r.id = bql.road_id
 
-  const [result] = await conn.query(
+          INNER JOIN activities a
+            ON a.id = bql.activity_id
+
+          LEFT JOIN (
+            SELECT
+              boq_line_id,
+              SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+            FROM work_instructions
+            WHERE project_id = ?
+              AND boq_line_id IS NOT NULL
+              AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+            GROUP BY boq_line_id
+          ) used
+            ON used.boq_line_id = bql.id
+
+          WHERE bql.id = ?
+            AND bl.project_id = ?
+            AND bl.is_locked = 1
+            AND bql.status = 'active'
+          LIMIT 1
+          `,
+          [projectId, boqLineId, projectId]
+        );
+
+        pendingRows = rows;
+      } else {
+        throw new Error(
+          "Work Instruction must be created from a saved WI BOQ line."
+        );
+      }
+
+      if (pendingRows.length === 0) {
+        throw new Error("Selected BOQ work item was not found for this project.");
+      }
+
+      const pendingQty = Number(pendingRows[0].pending_quantity || 0);
+
+      if (requestedQty > pendingQty) {
+        throw new Error(
+          `Cannot instruct ${requestedQty}. Pending quantity for ${pendingRows[0].road_code} / ${pendingRows[0].activity_code} is only ${pendingQty}.`
+        );
+      }
+
+      const finalRate = Number(
+        line.instructed_rate || line.planned_rate || pendingRows[0].rate || 0
+      );
+
+      const [result] = await conn.query(
         `
         INSERT INTO work_instructions
           (
             workplan_line_id,
             boq_line_id,
+            wi_boq_line_id,
             project_id,
             project_name_snapshot,
             road_id,
@@ -690,27 +1053,29 @@ router.post("/", authenticateJWT, async (req, res) => {
             additional_instruction_notes
           )
         VALUES
-          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
-          line.workplan_line_id || null,
-          line.boq_line_id || null,
+          null,
+          boqLineId > 0 ? boqLineId : null,
+          wiBoqLineId > 0 ? wiBoqLineId : null,
+
           projectId,
           line.project_name_snapshot ||
             project.project_name ||
             project.name ||
             null,
 
-          line.road_id || null,
-          line.road_code_snapshot || line.road_code || null,
-          line.road_name_snapshot || line.road_name || null,
+          line.road_id || pendingRows[0].road_id || null,
+          line.road_code_snapshot || line.road_code || pendingRows[0].road_code || null,
+          line.road_name_snapshot || line.road_name || pendingRows[0].road_name || null,
           line.contract_no_snapshot || project.project_number || null,
           line.contractor_snapshot || project.contractor || null,
 
           line.from_role || "RESIDENT ENGINEER",
           line.to_role || "SITE AGENT",
 
-          line.activity_id || null,
+          line.activity_id || pendingRows[0].activity_id || null,
 
           finalInstructionNumber,
           sheet_no || null,
@@ -718,19 +1083,22 @@ router.post("/", authenticateJWT, async (req, res) => {
           finalSource,
 
           instruction_date,
-          line.instructed_quantity || line.estimated_quantity || 0,
-          line.instructed_rate || 0,
+          requestedQty,
+          finalRate,
 
           req.user.id,
           finalIssuedToUserId || line.issued_to_user_id || null,
           line.notes || note || null,
 
           line.bill_no || null,
-          line.bill_item_no || null,
-          line.bill_item_description || line.description || null,
-          line.unit_of_measure || null,
+          line.bill_item_no || line.activity_code || pendingRows[0].activity_code || null,
+          line.bill_item_description ||
+            line.description ||
+            pendingRows[0].activity_name ||
+            null,
+          line.unit_of_measure || pendingRows[0].unit_of_measure || null,
           line.section_text || line.section || null,
-          line.estimated_quantity || line.instructed_quantity || null,
+          line.estimated_quantity || requestedQty || null,
           line.additional_instruction_notes || null,
         ]
       );
@@ -751,7 +1119,268 @@ router.post("/", authenticateJWT, async (req, res) => {
 
     console.error("Work instruction create error:", err);
     return res.status(500).json({
-      message: "Failed to save site instruction.",
+      message: err.message || "Failed to save site instruction.",
+    });
+  } finally {
+    conn.release();
+  }
+});
+
+router.put("/project/:projectId/boq-adjustments", async (req, res) => {
+  const projectId = Number(req.params.projectId);
+  const userId = req.user?.id || req.user?.userId || null;
+
+  const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
+  const availableAmount = Number(req.body.available_amount || 0);
+
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid project ID.",
+    });
+  }
+
+  if (lines.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: "No BOQ adjustment lines were provided.",
+    });
+  }
+
+  const conn = await db.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    const [lotRows] = await conn.query(
+      `
+      SELECT
+        wbl.id AS wi_boq_lot_id,
+        wbl.boq_lot_id,
+        bl.workplan_id,
+        bl.lot_no,
+        bl.category,
+        bl.locked_contract_sum
+      FROM wi_boq_lots wbl
+      INNER JOIN boq_lots bl
+        ON bl.id = wbl.boq_lot_id
+      WHERE wbl.project_id = ?
+      ORDER BY wbl.id ASC
+      LIMIT 1
+      `,
+      [projectId]
+    );
+
+    if (lotRows.length === 0) {
+      throw new Error(
+        "No editable Work Instruction BOQ lot found. Open the BOQ screen again to initialize it."
+      );
+    }
+
+    const wiBoqLot = lotRows[0];
+
+    for (const line of lines) {
+      const isNewRow = !!line.is_new_boq_row;
+      const sectionText = String(line.section_text || "").trim();
+      const editedPendingQty = Number(line.edited_pending_quantity || 0);
+      const rate = Number(line.rate || 0);
+      const notes = line.notes || null;
+
+      if (!Number.isFinite(editedPendingQty) || editedPendingQty < 0) {
+        throw new Error("Pending quantity cannot be negative.");
+      }
+
+      if (isNewRow) {
+        const roadId = Number(line.road_id || 0);
+        const activityId = Number(line.activity_id || 0);
+
+        if (!Number.isInteger(roadId) || roadId <= 0) {
+          throw new Error("Select a road for every new BOQ activity.");
+        }
+
+        if (!Number.isInteger(activityId) || activityId <= 0) {
+          throw new Error("Select an activity for every new BOQ activity.");
+        }
+
+        if (!Number.isFinite(rate) || rate <= 0) {
+          throw new Error("Enter a valid rate for every new BOQ activity.");
+        }
+
+        if (editedPendingQty <= 0) {
+          throw new Error(
+            "New BOQ activity pending quantity must be greater than zero."
+          );
+        }
+
+        const [activityRows] = await conn.query(
+          `
+          SELECT
+            code,
+            name,
+            unit
+          FROM activities
+          WHERE id = ?
+          LIMIT 1
+          `,
+          [activityId]
+        );
+
+        if (activityRows.length === 0) {
+          throw new Error("Selected activity was not found.");
+        }
+
+        const activity = activityRows[0];
+        const adjustedAmount = editedPendingQty * rate;
+
+        await conn.query(
+          `
+          INSERT INTO wi_boq_lines
+            (
+              wi_boq_lot_id,
+              project_id,
+              boq_lot_id,
+              source_boq_line_id,
+              road_id,
+              activity_id,
+              activity_code_snapshot,
+              activity_name_snapshot,
+              unit_snapshot,
+              section_text,
+              source_quantity,
+              source_rate,
+              source_amount,
+              adjusted_quantity,
+              adjusted_rate,
+              adjusted_amount,
+              notes,
+              line_origin,
+              status,
+              created_by,
+              updated_by
+            )
+          VALUES
+            (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, 'ENGINEER_ADDED', 'active', ?, ?)
+          `,
+          [
+            wiBoqLot.wi_boq_lot_id,
+            projectId,
+            wiBoqLot.boq_lot_id,
+            roadId,
+            activityId,
+            activity.code,
+            activity.name,
+            activity.unit,
+            sectionText,
+            editedPendingQty,
+            rate,
+            adjustedAmount,
+            notes,
+            userId,
+            userId,
+          ]
+        );
+
+        continue;
+      }
+
+      const wiBoqLineId = Number(line.wi_boq_line_id || 0);
+
+      if (!Number.isInteger(wiBoqLineId) || wiBoqLineId <= 0) {
+        continue;
+      }
+
+      const [existingRows] = await conn.query(
+        `
+        SELECT
+          wbln.id,
+          wbln.adjusted_rate,
+          COALESCE(used.already_instructed_quantity, 0) AS already_instructed_quantity
+        FROM wi_boq_lines wbln
+        LEFT JOIN (
+          SELECT
+            wi_boq_line_id,
+            SUM(COALESCE(instructed_quantity, 0)) AS already_instructed_quantity
+          FROM work_instructions
+          WHERE project_id = ?
+            AND wi_boq_line_id IS NOT NULL
+            AND COALESCE(status, 'draft') NOT IN ('cancelled', 'rejected', 'void')
+          GROUP BY wi_boq_line_id
+        ) used
+          ON used.wi_boq_line_id = wbln.id
+        WHERE wbln.id = ?
+          AND wbln.project_id = ?
+        LIMIT 1
+        `,
+        [projectId, wiBoqLineId, projectId]
+      );
+
+      if (existingRows.length === 0) {
+        throw new Error("One selected WI BOQ line was not found.");
+      }
+
+      const alreadyInstructedQty = Number(
+        existingRows[0].already_instructed_quantity || 0
+      );
+
+      const finalRate =
+        Number.isFinite(rate) && rate > 0
+          ? rate
+          : Number(existingRows[0].adjusted_rate || 0);
+
+      const adjustedTotalQty = alreadyInstructedQty + editedPendingQty;
+      const adjustedAmount = adjustedTotalQty * finalRate;
+
+      await conn.query(
+        `
+        UPDATE wi_boq_lines
+        SET
+          section_text = ?,
+          adjusted_quantity = ?,
+          adjusted_rate = ?,
+          adjusted_amount = ?,
+          notes = ?,
+          updated_by = ?
+        WHERE id = ?
+          AND project_id = ?
+        `,
+        [
+          sectionText,
+          adjustedTotalQty,
+          finalRate,
+          adjustedAmount,
+          notes,
+          userId,
+          wiBoqLineId,
+          projectId,
+        ]
+      );
+    }
+
+    await conn.query(
+      `
+      UPDATE wi_boq_lots
+      SET
+        available_amount = ?,
+        updated_by = ?
+      WHERE project_id = ?
+      `,
+      [availableAmount, userId, projectId]
+    );
+
+    await conn.commit();
+
+    return res.json({
+      success: true,
+      message: "BOQ adjustments saved successfully.",
+      available_amount: availableAmount,
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error("❌ Failed to save WI BOQ adjustments:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to save BOQ adjustments.",
     });
   } finally {
     conn.release();
