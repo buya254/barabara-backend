@@ -2,6 +2,9 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const authenticateJWT = require("../middlewares/auth");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 
 function normalizeRole(role) {
   return String(role || "")
@@ -19,6 +22,47 @@ function makeTempInstructionNumber() {
 
   return `BBR-SI-${stamp}`;
 }
+
+const workInstructionAttachmentDir = path.join(
+  __dirname,
+  "..",
+  "uploads",
+  "work-instruction-attachments"
+);
+
+fs.mkdirSync(workInstructionAttachmentDir, { recursive: true });
+
+const workInstructionAttachmentStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, workInstructionAttachmentDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || ".pdf") || ".pdf";
+    const safeName = `wi-notes-${Date.now()}-${Math.round(
+      Math.random() * 1e9
+    )}${ext}`;
+
+    cb(null, safeName);
+  },
+});
+
+const uploadWorkInstructionAttachment = multer({
+  storage: workInstructionAttachmentStorage,
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    const isPdf =
+      file.mimetype === "application/pdf" ||
+      path.extname(file.originalname || "").toLowerCase() === ".pdf";
+
+    if (!isPdf) {
+      return cb(new Error("Only PDF files are allowed for notes and drawings."));
+    }
+
+    cb(null, true);
+  },
+});
 
 async function userHasProjectAccess(userId, projectId) {
   const [rows] = await db.query(
@@ -108,6 +152,133 @@ async function getProject(projectId) {
   return rows[0] || null;
 }
 
+// POST /api/work-instructions/:instructionId/notes-attachment
+// Uploads one combined Notes and Drawings PDF for a specific work instruction line.
+router.post(
+  "/:instructionId/notes-attachment",
+  authenticateJWT,
+  uploadWorkInstructionAttachment.single("file"),
+  async (req, res) => {
+    try {
+      const instructionId = Number(req.params.instructionId);
+      const userId = req.user?.id || req.user?.userId || null;
+      const notesText = String(req.body.notes_text || "").trim();
+
+      if (!Number.isInteger(instructionId) || instructionId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid work instruction ID.",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Please attach a PDF file.",
+        });
+      }
+
+      const [instructionRows] = await db.query(
+        `
+        SELECT
+          id,
+          project_id,
+          instruction_number
+        FROM work_instructions
+        WHERE id = ?
+        LIMIT 1
+        `,
+        [instructionId]
+      );
+
+      if (instructionRows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Work instruction not found.",
+        });
+      }
+
+      const instruction = instructionRows[0];
+
+      const allowed = await canCreateProjectInstruction(
+        req.user,
+        Number(instruction.project_id)
+      );
+
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Only the assigned R.E or Admin can attach notes and drawings.",
+        });
+      }
+
+      const filePath = `/uploads/work-instruction-attachments/${req.file.filename}`;
+
+      await db.query(
+        `
+        INSERT INTO work_instruction_notes_attachments
+          (
+            work_instruction_id,
+            project_id,
+            instruction_number,
+            notes_text,
+            original_name,
+            file_name,
+            file_path,
+            mime_type,
+            file_size_bytes,
+            uploaded_by
+          )
+        VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          notes_text = VALUES(notes_text),
+          original_name = VALUES(original_name),
+          file_name = VALUES(file_name),
+          file_path = VALUES(file_path),
+          mime_type = VALUES(mime_type),
+          file_size_bytes = VALUES(file_size_bytes),
+          uploaded_by = VALUES(uploaded_by),
+          updated_at = CURRENT_TIMESTAMP
+        `,
+        [
+          instruction.id,
+          instruction.project_id,
+          instruction.instruction_number,
+          notesText || null,
+          req.file.originalname,
+          req.file.filename,
+          filePath,
+          req.file.mimetype,
+          req.file.size,
+          userId,
+        ]
+      );
+
+      return res.json({
+        success: true,
+        message: "Notes and drawings attached successfully.",
+        attachment: {
+          work_instruction_id: instruction.id,
+          project_id: instruction.project_id,
+          instruction_number: instruction.instruction_number,
+          notes_text: notesText || null,
+          file_path: filePath,
+          original_name: req.file.originalname,
+        },
+      });
+    } catch (err) {
+      console.error("❌ Work instruction attachment upload error:", err);
+
+      return res.status(500).json({
+        success: false,
+        message: err.message || "Failed to upload notes and drawings.",
+      });
+    }
+  }
+);
+
 // GET /api/work-instructions/project/:projectId
 router.get("/project/:projectId", authenticateJWT, async (req, res) => {
   try {
@@ -137,7 +308,12 @@ router.get("/project/:projectId", authenticateJWT, async (req, res) => {
         issued.username AS issued_by_username,
         issued.full_name AS issued_by_name,
         issued_to.username AS issued_to_username,
-        issued_to.full_name AS issued_to_name
+        issued_to.full_name AS issued_to_name,
+        wia.id AS notes_attachment_id,
+        wia.notes_text AS notes_attachment_text,
+        wia.file_path AS notes_attachment_file_path,
+        wia.original_name AS notes_attachment_original_name,
+        wia.created_at AS notes_attachment_created_at
       FROM work_instructions wi
       LEFT JOIN projects p
         ON p.id = wi.project_id
@@ -145,6 +321,8 @@ router.get("/project/:projectId", authenticateJWT, async (req, res) => {
         ON issued.id = wi.issued_by
       LEFT JOIN users issued_to
         ON issued_to.id = wi.issued_to_user_id
+      LEFT JOIN work_instruction_notes_attachments wia
+        ON wia.work_instruction_id = wi.id
       WHERE wi.project_id = ?
       ORDER BY
         wi.instruction_date DESC,
