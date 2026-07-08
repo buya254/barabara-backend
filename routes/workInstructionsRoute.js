@@ -32,6 +32,20 @@ const workInstructionAttachmentDir = path.join(
 
 fs.mkdirSync(workInstructionAttachmentDir, { recursive: true });
 
+const ALLOWED_WORK_INSTRUCTION_ATTACHMENT_EXTENSIONS = new Set([
+  ".pdf",
+  ".dwg",
+  ".dxf",
+  ".xml",
+  ".csv",
+  ".dwf",
+  ".txt",
+  ".landxml",
+]);
+
+const ALLOWED_WORK_INSTRUCTION_ATTACHMENT_LABEL =
+  "PDF, DWG, DXF, XML, CSV, DWF, TXT, or LANDXML";
+
 const workInstructionAttachmentStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, workInstructionAttachmentDir);
@@ -52,12 +66,14 @@ const uploadWorkInstructionAttachment = multer({
     fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
-    const isPdf =
-      file.mimetype === "application/pdf" ||
-      path.extname(file.originalname || "").toLowerCase() === ".pdf";
+    const ext = path.extname(file.originalname || "").toLowerCase();
 
-    if (!isPdf) {
-      return cb(new Error("Only PDF files are allowed for notes and drawings."));
+    if (!ALLOWED_WORK_INSTRUCTION_ATTACHMENT_EXTENSIONS.has(ext)) {
+      return cb(
+        new Error(
+          `Only ${ALLOWED_WORK_INSTRUCTION_ATTACHMENT_LABEL} files are allowed for notes, drawings, and instruction attachments.`
+        )
+      );
     }
 
     cb(null, true);
@@ -171,10 +187,10 @@ router.post(
         });
       }
 
-      if (!req.file) {
+       if (!req.file) {
         return res.status(400).json({
           success: false,
-          message: "Please attach a PDF file.",
+          message: `Please attach a ${ALLOWED_WORK_INSTRUCTION_ATTACHMENT_LABEL} file.`,
         });
       }
 
@@ -258,7 +274,7 @@ router.post(
 
       return res.json({
         success: true,
-        message: "Notes and drawings attached successfully.",
+        message: "Notes, drawings, and instruction attachment saved successfully.",
         attachment: {
           work_instruction_id: instruction.id,
           project_id: instruction.project_id,
@@ -273,7 +289,9 @@ router.post(
 
       return res.status(500).json({
         success: false,
-        message: err.message || "Failed to upload notes and drawings.",
+        message:
+          err.message ||
+          "Failed to upload notes, drawings, or instruction attachment.",
       });
     }
   }
