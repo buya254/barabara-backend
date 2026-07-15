@@ -390,7 +390,12 @@ router.get("/project/:projectId/usage", authenticateJWT, async (req, res) => {
         issued.username AS issued_by_username,
         issued.full_name AS issued_by_name,
         issued_to.username AS issued_to_username,
-        issued_to.full_name AS issued_to_name
+        issued_to.full_name AS issued_to_name,
+        wia.id AS notes_attachment_id,
+        wia.notes_text AS notes_attachment_text,
+        wia.file_path AS notes_attachment_file_path,
+        wia.original_name AS notes_attachment_original_name,
+        wia.created_at AS notes_attachment_created_at
       FROM work_instructions wi
       LEFT JOIN projects p
         ON p.id = wi.project_id
@@ -398,6 +403,8 @@ router.get("/project/:projectId/usage", authenticateJWT, async (req, res) => {
         ON issued.id = wi.issued_by
       LEFT JOIN users issued_to
         ON issued_to.id = wi.issued_to_user_id
+      LEFT JOIN work_instruction_notes_attachments wia
+        ON wia.work_instruction_id = wi.id
       WHERE wi.project_id = ?
       ORDER BY
         wi.instruction_date DESC,
@@ -479,6 +486,15 @@ router.get("/project/:projectId/usage", authenticateJWT, async (req, res) => {
           chainage_to: operation.chainageTo || "",
           activity_description: operation.activityDescription || "",
           remarks: operation.remarks || "",
+
+          // New reports will carry this exact timestamp from the Site Agent copy action.
+          // Older reports fall back to submitted_at/report_date.
+          executed_at:
+            operation.instructionCopiedAt ||
+            operation.copiedAt ||
+            report.submitted_at ||
+            report.report_date,
+
           submitted_at: report.submitted_at,
           confirmed_at: report.confirmed_at,
           are_approved_at: report.are_approved_at,
