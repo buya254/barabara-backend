@@ -2407,6 +2407,117 @@ router.get("/templates/arwp-import-template", async (req, res) => {
     const region = String(req.query.region || "Coast").trim();
     const arwpSheetName = getARWPSheetName(financialYear);
 
+    const requestedWorkplanId = Number(req.query.workplan_id || 0);
+const requestedProjectId = Number(req.query.project_id || 0);
+
+let sourceWorkplanId = requestedWorkplanId;
+
+if (!sourceWorkplanId) {
+  const [workplanRows] = await db.query(
+    `
+      SELECT id
+      FROM annual_workplans
+      WHERE REPLACE(financial_year, '-', '/') = REPLACE(?, '-', '/')
+        AND LOWER(TRIM(region)) = LOWER(TRIM(?))
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [financialYear, region]
+  );
+
+  if (workplanRows.length === 0) {
+    return res.status(404).json({
+      message:
+        "No current ARWP was found for this financial year and region.",
+    });
+  }
+
+  sourceWorkplanId = Number(workplanRows[0].id);
+}
+
+let lineSql = `
+  SELECT
+    awl.id,
+    awl.workplan_id,
+    awl.project_id,
+    awl.financial_year,
+    awl.lot_no,
+    awl.category,
+    awl.method,
+    awl.chainage_start,
+    awl.chainage_end,
+    awl.planned_quantity,
+    awl.planned_rate,
+    awl.planned_amount,
+    awl.remarks,
+
+    r.road_code,
+    r.road_name,
+    r.region AS road_region,
+    r.town,
+    r.surface_type,
+    r.condition_status,
+    r.road_length_km,
+
+    a.code AS activity_code,
+    a.name AS activity_name,
+    a.unit,
+
+    p.project_number,
+    p.project_name
+
+  FROM annual_workplan_lines awl
+
+  INNER JOIN roads r
+    ON r.id = awl.road_id
+
+  INNER JOIN activities a
+    ON a.id = awl.activity_id
+
+  LEFT JOIN projects p
+    ON p.id = awl.project_id
+
+  WHERE awl.workplan_id = ?
+    AND awl.status <> 'cancelled'
+    AND COALESCE(awl.is_ignored, 0) = 0
+`;
+
+const lineParams = [sourceWorkplanId];
+
+if (requestedProjectId > 0) {
+  lineSql += ` AND awl.project_id = ?`;
+  lineParams.push(requestedProjectId);
+}
+
+lineSql += `
+  ORDER BY
+    CAST(awl.lot_no AS UNSIGNED),
+    awl.lot_no,
+    awl.category,
+    r.road_code,
+    a.code,
+    awl.id
+`;
+
+const [currentLines] = await db.query(lineSql, lineParams);
+
+if (currentLines.length === 0) {
+  return res.status(404).json({
+    message:
+      requestedProjectId > 0
+        ? "No current ARWP lines were found for this project."
+        : "No current ARWP lines were found for this workplan.",
+  });
+}
+
+const sourceProjectLabel =
+  currentLines[0]?.project_number &&
+  currentLines[0]?.project_name
+    ? `${currentLines[0].project_number} - ${currentLines[0].project_name}`
+    : currentLines[0]?.project_number ||
+      currentLines[0]?.project_name ||
+      "Regional ARWP";
+
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Barabara";
     workbook.created = new Date();
@@ -2425,7 +2536,20 @@ router.get("/templates/arwp-import-template", async (req, res) => {
       {
         item: "Purpose",
         instruction:
-          "This template captures ARWP activity lines and package/lot information in the standard Barabara format.",
+          "This workbook is pre-populated from the current Barabara ARWP. The Engineer may adjust retained roads, activities, quantities, rates, chainages and package details before Admin imports it into a new project cycle.",
+      },
+      {
+        item: "Source Workplan ID",
+        instruction: String(sourceWorkplanId),
+      },
+      {
+        item: "Source Project",
+        instruction: sourceProjectLabel,
+      },
+      {
+        item: "Important",
+        instruction:
+          "Downloading and editing this workbook does not alter the current ARWP, BOQ, Work Instructions or existing project records.",
       },
       {
         item: "Financial Year",
@@ -2497,11 +2621,47 @@ router.get("/templates/arwp-import-template", async (req, res) => {
     arwp.getRow(1).font = { bold: true };
     arwp.views = [{ state: "frozen", ySplit: 1 }];
 
-    for (let rowNumber = 2; rowNumber <= 1001; rowNumber++) {
-      arwp.getCell(`M${rowNumber}`).value = {
-        formula: `J${rowNumber}*IF(O${rowNumber}<>"",O${rowNumber},N${rowNumber})`,
+    currentLines.forEach((line) => {
+      const row = arwp.addRow({
+        road_code: line.road_code || "",
+        road_name: line.road_name || "",
+        surface_type: line.surface_type || "",
+        condition: line.condition_status || "",
+        road_length_km:
+          Number(line.road_length_km || 0) || "",
+        activity_code: line.activity_code || "",
+        activity_name: line.activity_name || "",
+        method: line.method || "",
+        unit: line.unit || "",
+        planned_quantity:
+          Number(line.planned_quantity || 0),
+        chainage_start: line.chainage_start ?? "",
+        chainage_end: line.chainage_end ?? "",
+        amount_check: "",
+        rate_without_vat: "",
+        rate_with_vat:
+          Number(line.planned_rate || 0),
+        remarks: line.remarks || "",
+      });
+
+      row.getCell(13).value = {
+        formula:
+          `J${row.number}*IF(` +
+          `O${row.number}<>"",` +
+          `O${row.number},` +
+          `N${row.number})`,
       };
-    }
+
+      row.getCell(10).numFmt = "#,##0.00";
+      row.getCell(13).numFmt = "#,##0.00";
+      row.getCell(14).numFmt = "#,##0.00";
+      row.getCell(15).numFmt = "#,##0.00";
+    });
+
+    arwp.autoFilter = {
+      from: "A1",
+      to: "P1",
+    };
 
     // =========================
     // 3. PACKAGES sheet
@@ -2527,13 +2687,66 @@ router.get("/templates/arwp-import-template", async (req, res) => {
     packages.getRow(1).font = { bold: true };
     packages.views = [{ state: "frozen", ySplit: 1 }];
 
-    for (let rowNumber = 2; rowNumber <= 1001; rowNumber++) {
-      packages.getCell(`I${rowNumber}`).dataValidation = {
+    const exportedPackages = new Map();
+
+    currentLines.forEach((line) => {
+      const key = [
+        line.road_code || "",
+        line.lot_no || "",
+        line.category || "",
+      ].join("__");
+
+      if (!exportedPackages.has(key)) {
+        exportedPackages.set(key, {
+          town:
+            line.town ||
+            line.road_region ||
+            region,
+
+          road_code: line.road_code || "",
+          road_name: line.road_name || "",
+          surface_type: line.surface_type || "",
+          condition_status:
+            line.condition_status || "",
+
+          road_length_km:
+            Number(line.road_length_km || 0) || "",
+
+          budget: 0,
+          lot_no: line.lot_no || "",
+          category: line.category || "",
+          contract_number:
+            line.project_number || "",
+          package_description:
+            line.project_name || "",
+        });
+      }
+
+      const packageRow = exportedPackages.get(key);
+
+      packageRow.budget += Number(
+        line.planned_amount || 0
+      );
+    });
+
+    for (const packageData of exportedPackages.values()) {
+      const row = packages.addRow(packageData);
+
+      row.getCell(7).numFmt = "#,##0.00";
+
+      row.getCell(9).dataValidation = {
         type: "list",
         allowBlank: true,
-        formulae: ['"ROUTINE MAINTENANCE,PERIODIC MAINTENANCE"'],
+        formulae: [
+          '"ROUTINE MAINTENANCE,PERIODIC MAINTENANCE"',
+        ],
       };
     }
+
+    packages.autoFilter = {
+      from: "A1",
+      to: "K1",
+    };
 
     // Style headers
     [readme, arwp, packages].forEach((sheet) => {
@@ -2552,6 +2765,14 @@ router.get("/templates/arwp-import-template", async (req, res) => {
     const safeRegion = region.replace(/[^a-z0-9]+/gi, "_");
     const safeFY = financialYear.replace(/[^a-z0-9]+/gi, "_");
 
+    const safeProject = String(
+      currentLines[0]?.project_number ||
+        currentLines[0]?.project_name ||
+        "Regional"
+    )
+      .replace(/[^a-z0-9]+/gi, "_")
+      .replace(/^_+|_+$/g, "");
+
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -2559,7 +2780,7 @@ router.get("/templates/arwp-import-template", async (req, res) => {
 
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${safeRegion}_ARWP_Import_Template_${safeFY}.xlsx"`
+      `attachment; filename="ARWP_Template_${safeProject}_${safeFY}.xlsx"`
     );
 
     await workbook.xlsx.write(res);
