@@ -10,6 +10,10 @@ const path = require("path");
 const db = require("../db");
 const authenticateJWT = require("../middlewares/auth");
 
+const {
+  appendTextLog,
+} = require("../utils/textLogger");
+
 const uploadDir = path.join(__dirname, "../uploads");
 
 if (!fs.existsSync(uploadDir)) {
@@ -1371,6 +1375,42 @@ for (let rowNumber = startRow; rowNumber <= arwpSheet.rowCount; rowNumber++) {
 }
 
     await connection.commit();
+
+    appendTextLog("admin-utilities", {
+  event: "ARWP_REVISED_WORKBOOK_IMPORTED",
+
+  user_id: req.user?.id || null,
+  username:
+    req.user?.username ||
+    req.user?.email ||
+    null,
+
+  role: req.user?.role || null,
+
+  workplan_id: workplanId,
+  financial_year: financialYear,
+  region,
+
+  roads_processed:
+    roadsCreatedOrUpdated,
+
+  activities_processed:
+    activitiesCreatedOrUpdated,
+
+  lines_imported_or_updated:
+    linesInsertedOrUpdated,
+
+  skipped_rows: skippedRows,
+  rate_conflicts: rateConflicts.length,
+
+  original_filename:
+    req.file?.originalname || null,
+
+  ip_address:
+    req.headers["x-forwarded-for"] ||
+    req.socket?.remoteAddress ||
+    null,
+});
 
     fs.unlink(req.file.path, () => {});
 
@@ -2784,7 +2824,39 @@ const sourceProjectLabel =
     );
 
     await workbook.xlsx.write(res);
-    res.end();
+
+      appendTextLog("admin-utilities", {
+        event:
+          requestedProjectId > 0
+            ? "ARWP_PROJECT_TEMPLATE_DOWNLOADED"
+            : "ARWP_REGIONAL_ROLLOVER_DOWNLOADED",
+
+        user_id: req.user?.id || null,
+        username:
+          req.user?.username ||
+          req.user?.email ||
+          null,
+
+        role: req.user?.role || null,
+
+        workplan_id: sourceWorkplanId,
+        project_id:
+          requestedProjectId > 0
+            ? requestedProjectId
+            : null,
+
+        financial_year: financialYear,
+        region,
+        exported_lines: currentLines.length,
+
+        ip_address:
+          req.headers["x-forwarded-for"] ||
+          req.socket?.remoteAddress ||
+          null,
+      });
+
+      res.end();
+
   } catch (error) {
     console.error("Error generating ARWP template:", error);
 
