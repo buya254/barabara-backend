@@ -70,6 +70,21 @@ function workflowColumnForRole(roleRaw) {
   return null;
 }
 
+function normalizeProjectRole(raw) {
+  const role = normalizeRole(raw);
+
+  if (
+    role === "siteagent" ||
+    role === "inspector" ||
+    role === "are" ||
+    role === "re"
+  ) {
+    return role;
+  }
+
+  return null;
+}
+
 function uniqueRoadCodes(values) {
   if (!Array.isArray(values)) return [];
   return [
@@ -166,15 +181,31 @@ router.get("/users-by-financial-year", async (req, res) => {
  *
  * Already-assigned projects are excluded for that same user.
  */
+
 router.get("/assignment-projects", async (req, res) => {
   try {
-    console.log("HIT GET /api/utilities/assignment-projects", req.query);
+    console.log(
+      "HIT GET /api/utilities/assignment-projects",
+      req.query
+    );
 
     const userId = Number(req.query.user_id);
     const fyRaw = req.query.financial_year;
+    const projectRole = normalizeProjectRole(
+      req.query.project_role
+    );
 
     if (!Number.isInteger(userId)) {
-      return res.status(400).json({ message: "Valid user_id is required" });
+      return res.status(400).json({
+        message: "Valid user_id is required",
+      });
+    }
+
+    if (!projectRole) {
+      return res.status(400).json({
+        message:
+          "A valid project_role is required: siteagent, inspector, are or re",
+      });
     }
 
     const selectedFYKey = extractFYKey(fyRaw);
@@ -182,11 +213,14 @@ router.get("/assignment-projects", async (req, res) => {
 
     if (!selectedFYKey || !selectedFYEnd) {
       return res.status(400).json({
-        message: "Valid financial_year is required, for example 2025/26",
+        message:
+          "Valid financial_year is required, for example 2025/26",
       });
     }
 
-    const storedFY = toStoredFinancialYear(selectedFYKey);
+    const storedFY = toStoredFinancialYear(
+      selectedFYKey
+    );
 
     const [userRows] = await db.query(
       `
@@ -205,16 +239,23 @@ router.get("/assignment-projects", async (req, res) => {
     );
 
     if (!userRows || userRows.length === 0) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({
+        message: "User not found",
+      });
     }
 
     const selectedUser = userRows[0];
-    const selectedUserRole = normalizeRole(selectedUser.role);
-    const isRE = selectedUserRole === "re";
 
-    if (!isRE && !selectedUser.region) {
+    /*
+     * Regional authority now comes from the role being
+     * assigned on this project—not users.role.
+     */
+    const canCrossRegions = projectRole === "re";
+
+    if (!canCrossRegions && !selectedUser.region) {
       return res.status(400).json({
-        message: "Selected user has no region set in the users table",
+        message:
+          "Selected user has no region set. Site Agent, Inspector and A.R.E assignments require a user region.",
       });
     }
 
@@ -235,10 +276,13 @@ router.get("/assignment-projects", async (req, res) => {
         awpl.category
 
       FROM annual_workplans aw
+
       INNER JOIN annual_workplan_project_lots awpl
         ON awpl.workplan_id = aw.id
+
       INNER JOIN projects p
         ON p.id = awpl.project_id
+
       LEFT JOIN user_projects up
         ON up.project_id = p.id
         AND up.user_id = ?
@@ -246,41 +290,69 @@ router.get("/assignment-projects", async (req, res) => {
       WHERE up.project_id IS NULL
         AND (
           ? = 1
-          OR LOWER(TRIM(COALESCE(NULLIF(p.region, ''), aw.region))) = LOWER(TRIM(?))
+          OR LOWER(
+            TRIM(
+              COALESCE(
+                NULLIF(p.region, ''),
+                aw.region
+              )
+            )
+          ) = LOWER(TRIM(?))
         )
 
       ORDER BY
         p.project_number ASC,
         p.project_name ASC
       `,
-      [userId, isRE ? 1 : 0, selectedUser.region || ""]
+      [
+        userId,
+        canCrossRegions ? 1 : 0,
+        selectedUser.region || "",
+      ]
     );
 
-    const filteredProjects = (rows || []).filter((project) => {
-      const arwpFYEnd = extractFYEnd(project.workplan_financial_year);
-      return arwpFYEnd === selectedFYEnd;
-    });
+    const filteredProjects = (rows || []).filter(
+      (project) => {
+        const arwpFYEnd = extractFYEnd(
+          project.workplan_financial_year
+        );
+
+        return arwpFYEnd === selectedFYEnd;
+      }
+    );
 
     return res.json({
       success: true,
+
       user: {
         id: selectedUser.id,
         username: selectedUser.username,
         full_name: selectedUser.full_name,
-        role: selectedUser.role,
+        account_role: selectedUser.role,
         region: selectedUser.region,
-        financial_year: selectedUser.financial_year,
+        financial_year:
+          selectedUser.financial_year,
       },
+
+      selected_project_role: projectRole,
       financial_year: storedFY,
       financial_year_end: selectedFYEnd,
-      region_rule_applied: isRE ? "RE can see all regions" : selectedUser.region,
+
+      region_rule_applied: canCrossRegions
+        ? "R.E project role may be assigned across regions"
+        : selectedUser.region,
+
       projects: filteredProjects,
     });
   } catch (err) {
-    console.error("Error loading assignment projects:", err);
+    console.error(
+      "Error loading assignment projects:",
+      err
+    );
 
     return res.status(500).json({
-      message: "Failed to load ARWP-linked projects for assignment",
+      message:
+        "Failed to load ARWP-linked projects for assignment",
       error: err.message,
       code: err.code || null,
       sqlMessage: err.sqlMessage || null,
@@ -299,16 +371,46 @@ router.get("/assignment-projects", async (req, res) => {
  */
 router.post("/assign-user-project", async (req, res) => {
   try {
-    console.log("HIT POST /api/utilities/assign-user-project", req.body);
+    console.log(
+      "HIT POST /api/utilities/assign-user-project",
+      req.body
+    );
 
     const userId = Number(req.body.user_id);
     const projectId = Number(req.body.project_id);
-    const makePrimary = parseBoolean(req.body.make_primary);
 
-    if (!Number.isInteger(userId) || !Number.isInteger(projectId)) {
-      return res
-        .status(400)
-        .json({ message: "Valid user_id and project_id are required" });
+    const projectRole = normalizeProjectRole(
+      req.body.project_role
+    );
+
+    const makePrimary = parseBoolean(
+      req.body.make_primary
+    );
+
+    if (
+      !Number.isInteger(userId) ||
+      !Number.isInteger(projectId)
+    ) {
+      return res.status(400).json({
+        message:
+          "Valid user_id and project_id are required",
+      });
+    }
+
+    if (!projectRole) {
+      return res.status(400).json({
+        message:
+          "Select a valid role for this project: Site Agent, Inspector, A.R.E or R.E",
+      });
+    }
+
+    const workflowColumn =
+      workflowColumnForRole(projectRole);
+
+    if (!workflowColumn) {
+      return res.status(400).json({
+        message: "Unsupported project workflow role",
+      });
     }
 
     const [userRows] = await db.query(
@@ -328,22 +430,28 @@ router.post("/assign-user-project", async (req, res) => {
     );
 
     if (!userRows || userRows.length === 0) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({
+        message: "User not found",
+      });
     }
 
     const user = userRows[0];
 
-    const normalizedUserRole = normalizeRole(user.role);
+    const normalizedAccountRole = normalizeRole(
+      user.role
+    );
 
-      if (
-        normalizedUserRole === "admin" ||
-        normalizedUserRole === "systemadmin" ||
-        normalizedUserRole === "systemadministrator"
-      ) {
-        return res.status(403).json({
-          message: "Admin users cannot be assigned to projects.",
-        });
-      }
+    if (
+      normalizedAccountRole === "admin" ||
+      normalizedAccountRole === "systemadmin" ||
+      normalizedAccountRole ===
+        "systemadministrator"
+    ) {
+      return res.status(403).json({
+        message:
+          "Admin users cannot be assigned workflow roles on projects.",
+      });
+    }
 
     const [projectRows] = await db.query(
       `
@@ -360,36 +468,61 @@ router.post("/assign-user-project", async (req, res) => {
       [projectId]
     );
 
-    if (!projectRows || projectRows.length === 0) {
-      return res.status(404).json({ message: "Project not found" });
+    if (
+      !projectRows ||
+      projectRows.length === 0
+    ) {
+      return res.status(404).json({
+        message: "Project not found",
+      });
     }
 
     const project = projectRows[0];
 
-    const userRole = normalizeRole(user.role);
-    const isRE = userRole === "re";
+    /*
+     * Regional rule is now based on the role selected
+     * for this particular project.
+     */
+    const canCrossRegions = projectRole === "re";
 
-    const userRegion = String(user.region || "").trim().toLowerCase();
-    const projectRegion = String(project.region || "").trim().toLowerCase();
+    const userRegion = String(
+      user.region || ""
+    )
+      .trim()
+      .toLowerCase();
 
-    if (!isRE) {
+    const projectRegion = String(
+      project.region || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!canCrossRegions) {
       if (!userRegion) {
         return res.status(400).json({
-          message: "Selected user has no region set. Non-RE users must have a region.",
+          message:
+            "Selected user has no region set. This project role requires a user region.",
         });
       }
 
       if (!projectRegion) {
         return res.status(400).json({
-          message: "Selected project has no region set. Cannot enforce regional rule.",
+          message:
+            "Selected project has no region set. Cannot enforce the regional assignment rule.",
         });
       }
 
       if (userRegion !== projectRegion) {
         return res.status(409).json({
-          message: `Region mismatch: ${user.full_name || user.username} is in ${user.region}, but the project is in ${project.region}. Only RE can be assigned across regions.`,
+          message:
+            `${user.full_name || user.username} is in ` +
+            `${user.region}, while this project is in ` +
+            `${project.region}. Only an R.E project role ` +
+            `may be assigned across regions.`,
+
           userRegion: user.region,
           projectRegion: project.region,
+          projectRole,
         });
       }
     }
@@ -404,72 +537,158 @@ router.post("/assign-user-project", async (req, res) => {
 
     if (makePrimary) {
       await db.query(
-        "UPDATE user_projects SET is_primary = 0 WHERE user_id = ?",
+        `
+        UPDATE user_projects
+        SET is_primary = 0
+        WHERE user_id = ?
+        `,
         [userId]
       );
     }
 
+    /*
+     * user_projects grants access to the project.
+     */
     await db.query(
       `
-      INSERT INTO user_projects (user_id, project_id, is_primary)
+      INSERT INTO user_projects (
+        user_id,
+        project_id,
+        is_primary
+      )
       VALUES (?, ?, ?)
+
       ON DUPLICATE KEY UPDATE
         is_primary = VALUES(is_primary)
       `,
-      [userId, projectId, makePrimary ? 1 : 0]
+      [
+        userId,
+        projectId,
+        makePrimary ? 1 : 0,
+      ]
     );
 
-    const workflowColumn = workflowColumnForRole(user.role);
+    /*
+     * Ensure the workflow row exists first.
+     */
+    await db.query(
+      `
+      INSERT INTO project_workflow_assignments (
+        project_id
+      )
+      VALUES (?)
 
-    if (workflowColumn) {
-      const [workflowRows] = await db.query(
-        "SELECT project_id FROM project_workflow_assignments WHERE project_id = ? LIMIT 1",
-        [projectId]
-      );
+      ON DUPLICATE KEY UPDATE
+        project_id = VALUES(project_id)
+      `,
+      [projectId]
+    );
 
-      if (workflowRows.length > 0) {
-        await db.query(
-          `UPDATE project_workflow_assignments
-           SET ${workflowColumn} = ?
-           WHERE project_id = ?`,
-          [userId, projectId]
-        );
-      } else {
-        await db.query(
-          `INSERT INTO project_workflow_assignments
-           (project_id, ${workflowColumn})
-           VALUES (?, ?)`,
-          [projectId, userId]
-        );
-      }
-    }
+    /*
+     * A user may have only one workflow role within
+     * this same project.
+     *
+     * This removes them from any former slot on this
+     * project before assigning the newly selected role.
+     */
+    await db.query(
+      `
+      UPDATE project_workflow_assignments
+      SET
+        siteagent_id =
+          CASE
+            WHEN siteagent_id = ? THEN NULL
+            ELSE siteagent_id
+          END,
+
+        inspector_id =
+          CASE
+            WHEN inspector_id = ? THEN NULL
+            ELSE inspector_id
+          END,
+
+        are_id =
+          CASE
+            WHEN are_id = ? THEN NULL
+            ELSE are_id
+          END,
+
+        re_id =
+          CASE
+            WHEN re_id = ? THEN NULL
+            ELSE re_id
+          END
+
+      WHERE project_id = ?
+      `,
+      [
+        userId,
+        userId,
+        userId,
+        userId,
+        projectId,
+      ]
+    );
+
+    /*
+     * Assign the user into the selected role slot.
+     *
+     * workflowColumn is safe because it can only come
+     * from workflowColumnForRole().
+     */
+    await db.query(
+      `
+      UPDATE project_workflow_assignments
+      SET ${workflowColumn} = ?
+      WHERE project_id = ?
+      `,
+      [userId, projectId]
+    );
 
     return res.json({
       success: true,
-      message: "Project assigned to user.",
+
+      message:
+        `Project assigned successfully as ${projectRole.toUpperCase()}.`,
+
       user: {
         id: user.id,
         username: user.username,
         full_name: user.full_name,
-        role: user.role,
+        account_role: user.role,
         region: user.region,
-        primary_financial_year: user.financial_year,
+        primary_financial_year:
+          user.financial_year,
       },
+
       project: {
         id: project.id,
-        project_number: project.project_number,
-        project_name: project.project_name,
+        project_number:
+          project.project_number,
+        project_name:
+          project.project_name,
         region: project.region,
-        financial_year: project.financial_year,
-        normalized_financial_year: storedProjectFY,
+        financial_year:
+          project.financial_year,
+        normalized_financial_year:
+          storedProjectFY,
       },
-      regionRule: isRE ? "RE cross-region assignment allowed" : "Region matched",
+
+      project_role: projectRole,
+
+      regionRule: canCrossRegions
+        ? "R.E cross-region assignment allowed"
+        : "Region matched",
     });
   } catch (err) {
-    console.error("Error assigning project to user:", err);
+    console.error(
+      "Error assigning project to user:",
+      err
+    );
 
     return res.status(500).json({
-      message: "Failed to assign project to user",
+      message:
+        "Failed to assign project to user",
       error: err.message,
       code: err.code || null,
       sqlMessage: err.sqlMessage || null,
@@ -490,19 +709,46 @@ router.get("/user-projects/:userId", async (req, res) => {
     }
 
     const sql = `
-      SELECT 
-        up.id,
-        up.is_primary,
-        p.id AS project_id,
-        p.project_number,
-        p.project_name,
-        p.region,
-        p.financial_year
-      FROM user_projects up
-      JOIN projects p ON p.id = up.project_id
-      WHERE up.user_id = ?
-      ORDER BY up.is_primary DESC, p.project_number ASC
-    `;
+            SELECT
+              up.id,
+              up.is_primary,
+
+              p.id AS project_id,
+              p.project_number,
+              p.project_name,
+              p.region,
+              p.financial_year,
+
+              CASE
+                WHEN pwa.siteagent_id = up.user_id
+                  THEN 'siteagent'
+
+                WHEN pwa.inspector_id = up.user_id
+                  THEN 'inspector'
+
+                WHEN pwa.are_id = up.user_id
+                  THEN 'are'
+
+                WHEN pwa.re_id = up.user_id
+                  THEN 're'
+
+                ELSE NULL
+              END AS project_role
+
+            FROM user_projects up
+
+            JOIN projects p
+              ON p.id = up.project_id
+
+            LEFT JOIN project_workflow_assignments pwa
+              ON pwa.project_id = p.id
+
+            WHERE up.user_id = ?
+
+            ORDER BY
+              up.is_primary DESC,
+              p.project_number ASC
+          `;
 
     const [rows] = await db.query(sql, [userId]);
     return res.json(rows || []);
@@ -545,7 +791,7 @@ router.post("/unassign-user-projects", async (req, res) => {
     }
 
     const user = userRows[0];
-    const workflowColumn = workflowColumnForRole(user.role);
+    
 
     const placeholders = projectIds.map(() => "?").join(", ");
 
@@ -561,20 +807,51 @@ router.post("/unassign-user-projects", async (req, res) => {
 
     let workflowRowsCleared = 0;
 
-    // 2. Clear workflow assignment for this user's role only
-    if (workflowColumn) {
-      const [workflowResult] = await db.query(
-        `
-        UPDATE project_workflow_assignments
-        SET ${workflowColumn} = NULL
-        WHERE project_id IN (${placeholders})
-          AND ${workflowColumn} = ?
-        `,
-        [...projectIds, userId]
-      );
+/*
+ * Clear this user from whichever role they occupy
+ * on each selected project.
+ */
+const [workflowResult] = await db.query(
+  `
+  UPDATE project_workflow_assignments
+  SET
+    siteagent_id =
+      CASE
+        WHEN siteagent_id = ? THEN NULL
+        ELSE siteagent_id
+      END,
 
-      workflowRowsCleared = workflowResult.affectedRows || 0;
-    }
+    inspector_id =
+      CASE
+        WHEN inspector_id = ? THEN NULL
+        ELSE inspector_id
+      END,
+
+    are_id =
+      CASE
+        WHEN are_id = ? THEN NULL
+        ELSE are_id
+      END,
+
+    re_id =
+      CASE
+        WHEN re_id = ? THEN NULL
+        ELSE re_id
+      END
+
+  WHERE project_id IN (${placeholders})
+  `,
+  [
+    userId,
+    userId,
+    userId,
+    userId,
+    ...projectIds,
+  ]
+);
+
+workflowRowsCleared =
+  workflowResult.affectedRows || 0;
 
     return res.json({
       success: true,

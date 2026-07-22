@@ -32,20 +32,46 @@ router.get("/my-projects", authenticateJWT, async (req, res) => {
     }
 
     // Everyone else sees projects assigned through Utilities user_projects
-    const [rows] = await db.query(
+      const [rows] = await db.query(
       `
-        SELECT 
+        SELECT
           p.id,
           p.project_name AS name,
           p.project_name,
           p.project_number,
           p.region,
           p.financial_year,
-          up.is_primary
+          up.is_primary,
+
+          CASE
+            WHEN pwa.siteagent_id = up.user_id
+              THEN 'siteagent'
+
+            WHEN pwa.inspector_id = up.user_id
+              THEN 'inspector'
+
+            WHEN pwa.are_id = up.user_id
+              THEN 'are'
+
+            WHEN pwa.re_id = up.user_id
+              THEN 're'
+
+            ELSE NULL
+          END AS project_role
+
         FROM user_projects up
-        JOIN projects p ON p.id = up.project_id
+
+        JOIN projects p
+          ON p.id = up.project_id
+
+        LEFT JOIN project_workflow_assignments pwa
+          ON pwa.project_id = p.id
+
         WHERE up.user_id = ?
-        ORDER BY up.is_primary DESC, p.id DESC
+
+        ORDER BY
+          up.is_primary DESC,
+          p.id DESC
       `,
       [userId]
     );
