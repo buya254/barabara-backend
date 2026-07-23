@@ -39,6 +39,38 @@ function isAssignedToProject(user, assignment) {
   );
 }
 
+function getAssignedProjectRole(user, assignment) {
+  if (!assignment) return null;
+
+  const uid = String(user?.id ?? "");
+
+  if (
+    String(assignment.siteagent_id || "") === uid
+  ) {
+    return "siteagent";
+  }
+
+  if (
+    String(assignment.inspector_id || "") === uid
+  ) {
+    return "inspector";
+  }
+
+  if (
+    String(assignment.are_id || "") === uid
+  ) {
+    return "are";
+  }
+
+  if (
+    String(assignment.re_id || "") === uid
+  ) {
+    return "re";
+  }
+
+  return null;
+}
+
 async function getReport(report_id) {
   const [rows] = await db.query("SELECT * FROM daily_work_reports WHERE id = ?", [
     report_id,
@@ -2440,61 +2472,75 @@ router.put("/:id/confirm", authenticateJWT, async (req, res) => {
  */
 router.put("/:id/request-change", authenticateJWT, async (req, res) => {
   try {
-    const userRole = String(req.user.role || "").toLowerCase();
+    const report = await getReport(
+      req.params.id
+    );
+
+    if (!report) {
+      return res.status(404).json({
+        message: "Report not found",
+      });
+    }
+
+    const assignment = await getAssignment(
+      report.project_id
+    );
+
+    const projectRole =
+      getAssignedProjectRole(
+        req.user,
+        assignment
+      );
 
     const rules = {
-  inspector: {
-    expectedStatus: "SUBMITTED",
-    assignmentColumn: "inspector_id",
-    actionType: "INSPECTOR_REQUESTED_CHANGE",
-    targetRole: "Site Agent",
-  },
-  are: {
-    expectedStatus: "CONFIRMED",
-    assignmentColumn: "are_id",
-    actionType: "ARE_REQUESTED_CHANGE",
-    targetRole: "Site Agent",
-  },
-  re: {
-    expectedStatus: "ARE_APPROVED",
-    assignmentColumn: "re_id",
-    actionType: "RE_REQUESTED_CHANGE",
-    targetRole: "Site Agent",
-  },
-};
+      inspector: {
+        expectedStatus: "SUBMITTED",
+        actionType:
+          "INSPECTOR_REQUESTED_CHANGE",
+        roleLabel: "Inspector",
+      },
 
-    const rule = rules[userRole];
+      are: {
+        expectedStatus: "CONFIRMED",
+        actionType:
+          "ARE_REQUESTED_CHANGE",
+        roleLabel: "A.R.E",
+      },
+
+      re: {
+        expectedStatus: "ARE_APPROVED",
+        actionType:
+          "RE_REQUESTED_CHANGE",
+        roleLabel: "R.E",
+      },
+    };
+
+    const rule = rules[projectRole];
 
     if (!rule) {
       return res.status(403).json({
-        message: "Only Inspector, A.R.E, or R.E can request changes",
+        message:
+          "Only the assigned Inspector, A.R.E or R.E can request changes",
       });
     }
 
-    const report = await getReport(req.params.id);
-    if (!report) {
-      return res.status(404).json({ message: "Report not found" });
-    }
-
-    if (String(report.status) !== rule.expectedStatus) {
-      return res.status(409).json({
-        message: `This report must be ${rule.expectedStatus} before ${userRole.toUpperCase()} can request changes.`,
-      });
-    }
-
-    if (Number(report.change_requested || 0) === 1) {
-      return res.status(409).json({
-        message: "This report already has a pending change request.",
-      });
-    }
-
-    const assignment = await getAssignment(report.project_id);
     if (
-      !assignment ||
-      String(assignment[rule.assignmentColumn] || "") !== String(req.user.id)
+      String(report.status) !==
+      rule.expectedStatus
     ) {
-      return res.status(403).json({
-        message: `You are not the assigned ${userRole.toUpperCase()} for this project`,
+      return res.status(409).json({
+        message:
+          `This report must be ${rule.expectedStatus} ` +
+          `before ${rule.roleLabel} can request changes.`,
+      });
+    }
+
+    if (
+      Number(report.change_requested || 0) === 1
+    ) {
+      return res.status(409).json({
+        message:
+          "This report already has a pending change request.",
       });
     }
 
@@ -2502,28 +2548,36 @@ router.put("/:id/request-change", authenticateJWT, async (req, res) => {
 
     if (!notes || !String(notes).trim()) {
       return res.status(400).json({
-        message: "Please provide instructions for the requested change.",
+        message:
+          "Please provide instructions for the requested change.",
       });
     }
 
     await db.query(
       `
       UPDATE daily_work_reports
-      SET status = 'DRAFT',
-          change_requested = 1,
-          change_request_notes = ?,
-          change_requested_by = ?,
-          change_requested_role = ?,
-          change_requested_at = ?,
-          confirmed_at = NULL,
-          are_approved_at = NULL,
-          re_approved_at = NULL
+      SET
+        status = 'DRAFT',
+        change_requested = 1,
+        change_request_notes = ?,
+        change_requested_by = ?,
+        change_requested_role = ?,
+        change_requested_at = ?,
+        confirmed_at = NULL,
+        are_approved_at = NULL,
+        re_approved_at = NULL
       WHERE id = ?
       `,
       [
         String(notes).trim(),
         req.user.id,
-        req.user.role || userRole,
+
+        /*
+         * Save Betty as A.R.E when she is acting
+         * as the A.R.E on this project.
+         */
+        projectRole,
+
         nowSql(),
         report.id,
       ]
@@ -2533,19 +2587,28 @@ router.put("/:id/request-change", authenticateJWT, async (req, res) => {
       reportId: report.id,
       actionType: rule.actionType,
       userId: req.user.id,
-      userRole: req.user.role,
+      userRole: projectRole,
       notes: String(notes).trim(),
     });
 
-    const updated = await getReportWithParsed(report.id);
+    const updated =
+      await getReportWithParsed(report.id);
 
     return res.json({
-      message: "Change requested. Report returned to Site Agent draft with notes.",
+      message:
+        "Change requested. Report returned to Site Agent draft with notes.",
+
       report: updated,
     });
   } catch (err) {
-    console.error("❌ request-change error:", err);
-    return res.status(500).json({ message: "Server error" });
+    console.error(
+      "❌ request-change error:",
+      err
+    );
+
+    return res.status(500).json({
+      message: "Server error",
+    });
   }
 });
 
@@ -2619,55 +2682,108 @@ router.put("/:id/inspector-edit", authenticateJWT, async (req, res) => {
  * PUT /api/daily-work-reports/:id/are-approve
  * body: { notes? }
  */
+
 router.put("/:id/are-approve", authenticateJWT, async (req, res) => {
   try {
-    if (!isRole(req.user, "are")) {
-      return res.status(403).json({ message: "Only ARE can approve at this stage" });
-    }
-
     const report = await getReport(req.params.id);
-    if (!report) return res.status(404).json({ message: "Report not found" });
+
+    if (!report) {
+      return res.status(404).json({
+        message: "Report not found",
+      });
+    }
 
     if (String(report.status) !== "CONFIRMED") {
-      return res.status(409).json({ message: "Only CONFIRMED reports can be ARE approved" });
+      return res.status(409).json({
+        message:
+          "Only CONFIRMED reports can be A.R.E approved",
+      });
     }
 
-    if (Number(report.change_requested || 0) === 1) {
+    if (
+      Number(report.change_requested || 0) === 1
+    ) {
       return res.status(409).json({
         message:
           "This report has a pending change request. It must be resolved before A.R.E approval.",
       });
     }
 
-    const assignment = await getAssignment(report.project_id);
-    if (!assignment || String(assignment.are_id) !== String(req.user.id)) {
-      return res.status(403).json({ message: "You are not the assigned ARE for this project" });
+    const assignment = await getAssignment(
+      report.project_id
+    );
+
+    const projectRole =
+      getAssignedProjectRole(
+        req.user,
+        assignment
+      );
+
+    /*
+     * Authority comes from the report's project,
+     * not from users.role.
+     *
+     * Betty may have users.role = re but still be
+     * the assigned A.R.E for this project.
+     */
+    if (projectRole !== "are") {
+      return res.status(403).json({
+        message:
+          "You are not the assigned A.R.E for this project",
+      });
     }
 
     const { notes } = req.body || {};
+    const approvedAt = nowSql();
 
     await db.query(
       `
       UPDATE daily_work_reports
-      SET status = 'ARE_APPROVED', are_approved_at = ?
+      SET
+        status = 'ARE_APPROVED',
+        are_approved_at = ?
       WHERE id = ?
       `,
-      [nowSql(), report.id]
+      [approvedAt, report.id]
     );
 
     await logDwrAction({
       reportId: report.id,
       actionType: "ARE_APPROVED",
       userId: req.user.id,
-      userRole: req.user.role,
+
+      /*
+       * Record the role Betty occupied on this project,
+       * rather than her global account role.
+       */
+      userRole: projectRole,
+
       notes: notes || null,
     });
 
-    const updated = await getReportWithParsed(report.id);
-    return res.json({ message: "Approved by ARE", report: updated });
+    const updated =
+      await getReportWithParsed(report.id);
+
+    return res.json({
+      message: "Approved by A.R.E",
+      report: updated,
+
+      next_stage: {
+        status: "ARE_APPROVED",
+        role: "re",
+        assigned_user_id:
+          assignment?.re_id || null,
+      },
+    });
   } catch (err) {
-    console.error("❌ ARE approve error:", err);
-    return res.status(500).json({ message: "Server error" });
+    console.error(
+      "❌ A.R.E approve error:",
+      err
+    );
+
+    return res.status(500).json({
+      message: "Server error",
+    });
   }
 });
 
@@ -2678,45 +2794,80 @@ router.put("/:id/are-approve", authenticateJWT, async (req, res) => {
  */
 router.put("/:id/re-approve", authenticateJWT, async (req, res) => {
   try {
-    if (!isRole(req.user, "re")) {
-      return res.status(403).json({ message: "Only RE can approve at this stage" });
-    }
-
     const report = await getReport(req.params.id);
-    if (!report) return res.status(404).json({ message: "Report not found" });
 
-    if (String(report.status) !== "ARE_APPROVED") {
-      return res.status(409).json({ message: "Only ARE_APPROVED reports can be RE approved" });
+    if (!report) {
+      return res.status(404).json({
+        message: "Report not found",
+      });
     }
 
-    if (Number(report.change_requested || 0) === 1) {
+    if (
+      String(report.status) !== "ARE_APPROVED"
+    ) {
+      return res.status(409).json({
+        message:
+          "Only ARE_APPROVED reports can be R.E approved",
+      });
+    }
+
+    if (
+      Number(report.change_requested || 0) === 1
+    ) {
       return res.status(409).json({
         message:
           "This report has a pending change request. It must be resolved before R.E final approval.",
       });
     }
 
-    const assignment = await getAssignment(report.project_id);
-    if (!assignment || String(assignment.re_id) !== String(req.user.id)) {
-      return res.status(403).json({ message: "You are not the assigned RE for this project" });
+    const assignment = await getAssignment(
+      report.project_id
+    );
+
+    const projectRole =
+      getAssignedProjectRole(
+        req.user,
+        assignment
+      );
+
+    /*
+     * The final approver must be the R.E assigned
+     * specifically to this report's project.
+     */
+    if (projectRole !== "re") {
+      return res.status(403).json({
+        message:
+          "You are not the assigned R.E for this project",
+      });
     }
 
     const { notes } = req.body || {};
 
-    // Ensure contract_id exists (keep this behavior)
     let contractId = report.contract_id;
 
     if (!contractId) {
-      const [cRows] = await db.query(
-        "SELECT id FROM contracts WHERE project_id = ? ORDER BY id DESC LIMIT 1",
+      const [contractRows] = await db.query(
+        `
+        SELECT id
+        FROM contracts
+        WHERE project_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        `,
         [report.project_id]
       );
-      if (cRows.length > 0) {
-        contractId = cRows[0].id;
-        await db.query("UPDATE daily_work_reports SET contract_id = ? WHERE id = ?", [
-          contractId,
-          report.id,
-        ]);
+
+      if (contractRows.length > 0) {
+        contractId = contractRows[0].id;
+
+        await db.query(
+          `
+          UPDATE daily_work_reports
+          SET contract_id = ?
+          WHERE id = ?
+          `,
+          [contractId, report.id]
+        );
       }
     }
 
@@ -2727,70 +2878,116 @@ router.put("/:id/re-approve", authenticateJWT, async (req, res) => {
       });
     }
 
-    // Validate JSON for CAST(? AS JSON)
     let jsonForDb = report.form_json;
+
     try {
       JSON.parse(jsonForDb);
     } catch {
       jsonForDb = JSON.stringify({});
     }
 
-    // 1) Mark RE approved
+    const approvedAt = nowSql();
+
     await db.query(
       `
       UPDATE daily_work_reports
-      SET status = 'RE_APPROVED', re_approved_at = ?
+      SET
+        status = 'RE_APPROVED',
+        re_approved_at = ?
       WHERE id = ?
       `,
-      [nowSql(), report.id]
+      [approvedAt, report.id]
     );
 
     await logDwrAction({
       reportId: report.id,
       actionType: "RE_APPROVED",
       userId: req.user.id,
-      userRole: req.user.role,
+
+      /*
+       * Record the project-specific role.
+       */
+      userRole: projectRole,
+
       notes: notes || null,
     });
 
-    // 2) Upsert into approved_daily_forms (contract_id + form_date)
     const [existing] = await db.query(
-      "SELECT id FROM approved_daily_forms WHERE contract_id = ? AND form_date = ? LIMIT 1",
+      `
+      SELECT id
+      FROM approved_daily_forms
+      WHERE contract_id = ?
+        AND form_date = ?
+      LIMIT 1
+      `,
       [contractId, report.report_date]
     );
 
-    const approvedBy = String(req.user.username || req.user.id || "");
+    const approvedBy = String(
+      req.user.username ||
+      req.user.id ||
+      ""
+    );
 
     if (existing.length > 0) {
       await db.query(
         `
         UPDATE approved_daily_forms
-        SET form_data = CAST(? AS JSON),
-            approved_by = ?
+        SET
+          form_data = CAST(? AS JSON),
+          approved_by = ?
         WHERE id = ?
         `,
-        [jsonForDb, approvedBy, existing[0].id]
+        [
+          jsonForDb,
+          approvedBy,
+          existing[0].id,
+        ]
       );
     } else {
       await db.query(
         `
         INSERT INTO approved_daily_forms
-          (contract_id, form_date, form_data, approved_by)
+          (
+            contract_id,
+            form_date,
+            form_data,
+            approved_by
+          )
         VALUES (?, ?, CAST(? AS JSON), ?)
         `,
-        [contractId, report.report_date, jsonForDb, approvedBy]
+        [
+          contractId,
+          report.report_date,
+          jsonForDb,
+          approvedBy,
+        ]
       );
     }
 
-    const updated = await getReportWithParsed(report.id);
+    const updated =
+      await getReportWithParsed(report.id);
+
     return res.json({
-      message: "Approved by RE and sealed into approved_daily_forms",
+      message:
+        "Approved by R.E and sealed into approved_daily_forms",
+
       report: updated,
-      sealed: { contract_id: contractId, form_date: report.report_date },
+
+      sealed: {
+        contract_id: contractId,
+        form_date: report.report_date,
+      },
     });
   } catch (err) {
-    console.error("❌ RE approve/seal error:", err);
-    return res.status(500).json({ message: "Server error" });
+    console.error(
+      "❌ R.E approve/seal error:",
+      err
+    );
+
+    return res.status(500).json({
+      message: "Server error",
+    });
   }
 });
 

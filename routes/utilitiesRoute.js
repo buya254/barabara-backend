@@ -85,6 +85,42 @@ function normalizeProjectRole(raw) {
   return null;
 }
 
+function allowedProjectRolesForAccount(accountRoleRaw) {
+  const accountRole = normalizeRole(accountRoleRaw);
+
+  if (accountRole === "siteagent") {
+    return ["siteagent"];
+  }
+
+  if (accountRole === "inspector") {
+    return ["inspector"];
+  }
+
+  if (
+    accountRole === "are" ||
+    accountRole === "re"
+  ) {
+    return ["are", "re"];
+  }
+
+  return [];
+}
+
+function normalizeProjectRole(raw) {
+  const role = normalizeRole(raw);
+
+  if (
+    role === "siteagent" ||
+    role === "inspector" ||
+    role === "are" ||
+    role === "re"
+  ) {
+    return role;
+  }
+
+  return null;
+}
+
 function uniqueRoadCodes(values) {
   if (!Array.isArray(values)) return [];
   return [
